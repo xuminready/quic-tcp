@@ -1,0 +1,7 @@
+[package]
+name = "quic-tcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mio = { version = "1.0.3", features = ["net", "os-poll"] }
