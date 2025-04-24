@@ -1,7 +1,17 @@
 [package]
 name = "quic-tcp"
 version = "0.1.0"
+authors = ["Min Xu"]
+license = "BSD-2-Clause"
+repository = "https://github.com/xuminready/quic-tcp"
 edition = "2024"
 
 [dependencies]
+env_logger = "0.11.8"
+log = { version = "0.4.27", features = ["max_level_trace", "release_max_level_warn"] }
 mio = { version = "1.0.3", features = ["net", "os-poll"] }
+url = "2.5.4"
+
+[[bin]]
+name = "tcp2quic" # a TCP server -> QUIC
+path = "src/tcp2quic.rs" # Path to the binary file (optional if following the standard convention)
