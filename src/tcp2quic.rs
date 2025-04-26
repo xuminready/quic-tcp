@@ -6,19 +6,20 @@ use std::env::Args;
 use mio::net::TcpStream;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use url::Url;
+
 // Setup some tokens to allow us to identify which event is for which socket.
 const TCP_SERVER: mio::Token = mio::Token(0);
 const UDP_CLIENT: mio::Token = mio::Token(1);
 
 fn main() -> std::io::Result<()> {
     env_logger::init(); // Initialize env_logger
-    let mut args = std::env::args();
+    let args: Vec<String> = std::env::args().collect();
 
-    let cmd = &args.next().unwrap();
-
-    if args.len() != 1 {
-        debug!("Usage: {cmd} URL");
+    if args.len() < 3 {
+        eprintln!(
+            "Usage: {} <QUIC_Server_IP_ADDRESS> <PORT> <TCP_Server_IP_ADDRESS> <PORT>",
+            args[0]
+        );
         return Err(io::Error::new(io::ErrorKind::Other, "args error"));
     }
 
@@ -27,17 +28,27 @@ fn main() -> std::io::Result<()> {
     // Create storage for events.
     let mut events = mio::Events::with_capacity(1024);
 
+    let ip_str = &args[1];
+    let port_str = &args[2];
+
+    println!(
+        "Attempting to validate IP: {} and Port: {}",
+        ip_str, port_str
+    );
+
     // Setup the TCP server socket.
-    let addr = "127.0.0.1:9000".parse().unwrap();
+    let addr = match validate_ip_and_port(ip_str, port_str) {
+        Ok(addr) => addr,
+        Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err)),
+    };
     let mut tcp_server = mio::net::TcpListener::bind(addr)?;
 
     // Register the server with poll we can receive events for it.
     poll.registry()
         .register(&mut tcp_server, TCP_SERVER, mio::Interest::READABLE)?;
 
-    let url = url::Url::parse(&args.next().unwrap()).unwrap();
     // Resolve server address.
-    let peer_addr: std::net::SocketAddr = url.socket_addrs(|| None).unwrap()[0];
+    let peer_addr: std::net::SocketAddr = addr; //TODO replace with UDP addr
     // Bind to INADDR_ANY or IN6ADDR_ANY depending on the IP family of the
     // server address. This is needed on macOS and BSD variants that don't
     // support binding to IN6ADDR_ANY for both v4 and v6.
@@ -141,7 +152,7 @@ fn main() -> std::io::Result<()> {
                     if done {
                         debug!("done, close tcp stream");
                         // remove from the hashmap
-                        if let Some(stream_id) = token_streamId_map.remove(&token){
+                        if let Some(stream_id) = token_streamId_map.remove(&token) {
                             streamId_token_map.remove(&stream_id);
                         }
                         if let Some(mut tcp_stream) = token_tcp_stream_map.remove(&token) {
@@ -170,4 +181,27 @@ fn would_block(err: &std::io::Error) -> bool {
 fn interrupted(err: &std::io::Error) -> bool {
     debug!("interrupted");
     err.kind() == std::io::ErrorKind::Interrupted
+}
+
+fn validate_ip_and_port(ip_str: &str, port_str: &str) -> Result<std::net::SocketAddr, String> {
+    // First, let's try parsing the IP address.
+    let ip: std::net::IpAddr = match ip_str.parse() {
+        Ok(addr) => addr,
+        Err(_) => return Err(String::from("Invalid IP address format")),
+    };
+
+    // Now, let's tackle the port.
+    let port: u16 = match port_str.parse() {
+        Ok(p) => {
+            if p > 0 && p <= 65535 {
+                p
+            } else {
+                return Err(String::from("Port number must be between 1 and 65535"));
+            }
+        }
+        Err(_) => return Err(String::from("Invalid port number format")),
+    };
+
+    // If both parsing steps are successful, we can construct a SocketAddr.
+    Ok(std::net::SocketAddr::new(ip, port))
 }
