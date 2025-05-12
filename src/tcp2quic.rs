@@ -5,7 +5,8 @@ mod utils;
 
 use std::env::Args;
 
-use mio::net::TcpStream;
+use mio::net::{TcpStream, UdpSocket};
+use quiche::Connection;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use utils::*;
@@ -59,6 +60,16 @@ fn main() -> std::io::Result<()> {
         std::net::SocketAddr::V4(_) => "0.0.0.0:0",
         std::net::SocketAddr::V6(_) => "[::]:0",
     };
+    // Create the UDP socket backing the QUIC connection, and register it with
+    // the event loop.
+    let mut udp_socket = mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
+    poll.registry()
+        .register(&mut udp_socket, UDP_CLIENT, mio::Interest::READABLE)
+        .unwrap();
+    let mut quic_connection = create_quic_connection(Some(addr.to_string().as_str()), &peer_addr, &udp_socket);
+    debug!("initiate quic connection...");
+
+    quic_udp(&mut quic_connection, &udp_socket);
 
     // Map of `Token` -> `TcpStream`.
     let mut token_tcp_stream_map = HashMap::new();
@@ -72,12 +83,20 @@ fn main() -> std::io::Result<()> {
         poll.poll(&mut events, None).unwrap();
         for event in events.iter() {
             match event.token() {
+                UDP_CLIENT =>{
+                    udp_quic(&mut quic_connection, &udp_socket);
+                    for stream_id in quic_connection.readable(){
+                        let token = streamId_token_map.get(&stream_id).unwrap();
+                        let tcp_stream = token_tcp_stream_map.get_mut(token).unwrap();
+                        quic_tcp(tcp_stream, &mut quic_connection, &stream_id)
+                    }
+                }
                 TCP_SERVER => loop {
                     // Received an event for the TCP server socket, which
                     // indicates we can accept an connection.
                     let (mut tcp_stream, address) = match tcp_server.accept() {
                         Ok((tcp_stream, address)) => (tcp_stream, address),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        Err(e) if would_block(&e) => {
                             // If we get a `WouldBlock` error we know our
                             // listener has no more incoming connections queued,
                             // so we can return to polling and wait for some
@@ -102,8 +121,6 @@ fn main() -> std::io::Result<()> {
                     streamId_token_map.insert(current_stream_id.clone(), token.clone());
                     token_streamId_map.insert(token.clone(), current_stream_id.clone());
 
-                    // quic_udp(&mut quic_connection, &udp_socket, &mut out);
-
                     token_tcp_stream_map.insert(token, tcp_stream);
                 },
                 token => {
@@ -111,43 +128,9 @@ fn main() -> std::io::Result<()> {
                     let done = if let Some(tcp_stream) = token_tcp_stream_map.get_mut(&token) {
                         let mut is_tcp_stream_closed = false;
                         let stream_id = token_streamId_map.get(&token).unwrap();
-                        if event.is_readable() {
-                            let mut buf = [0; 65535];
-                            loop {
-                                match tcp_stream.read(&mut buf) {
-                                    Ok(0) => {
-                                        // Reading 0 bytes means the other side has closed the
-                                        // connection or is done writing, then so are we.
-                                        is_tcp_stream_closed = true;
-                                        break;
-                                    }
-                                    Ok(n) => {
-                                        print!("{}", unsafe {
-                                            std::str::from_utf8_unchecked(&buf[..n])
-                                        });
-                                        tcp_stream.write(&buf[..n]).unwrap();
-                                        tcp_stream.flush().unwrap();
-                                    }
-                                    // Would block "errors" are the OS's way of saying that the
-                                    // connection is not actually ready to perform this I/O operation.
-                                    Err(ref err) if would_block(err) => break,
-                                    Err(ref err) if interrupted(err) => continue,
-                                    // Other errors we'll consider fatal.
-                                    Err(err) => {
-                                        debug!("tcp recv() failed: {:?}", err);
-                                        is_tcp_stream_closed = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // tcp_quic(tcp_stream, &mut quic_connection, stream_id);
-                            // quic_udp(&mut quic_connection, &udp_socket, &mut out);
-                        } else {
-                            debug!("unknown event");
-                        }
-
-                        is_tcp_stream_closed
+                        tcp_quic(tcp_stream, &mut quic_connection, stream_id);
+                        false
+                        //TODO return the TCP connection status remove disconnection and update hashmap
                     } else {
                         // Sporadic events happen, we can safely ignore them.
                         false
@@ -167,6 +150,7 @@ fn main() -> std::io::Result<()> {
         }
 
         // flush the data to UDP socket
+        quic_udp(&mut quic_connection, &udp_socket);
     }
 }
 

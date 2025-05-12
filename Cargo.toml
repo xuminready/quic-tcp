@@ -10,6 +10,8 @@ edition = "2024"
 env_logger = "0.11.8"
 log = { version = "0.4.27", features = ["max_level_trace", "release_max_level_warn"] }
 mio = { version = "1.0.3", features = ["net", "os-poll"] }
+quiche = "0.24.2"
+ring = "0.17.14"
 
 [[bin]]
 name = "tcp2quic" # a TCP server -> QUIC
