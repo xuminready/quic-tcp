@@ -1,11 +1,14 @@
 #[macro_use]
 extern crate log;
 
+mod utils;
+
 use std::env::Args;
 
 use mio::net::TcpStream;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use utils::*;
 
 // Setup some tokens to allow us to identify which event is for which socket.
 const TCP_SERVER: mio::Token = mio::Token(0);
@@ -162,6 +165,8 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
+
+        // flush the data to UDP socket
     }
 }
 
@@ -173,14 +178,6 @@ fn next(current: &mut mio::Token) -> mio::Token {
 
 fn next_stream_id(current: &mut u64) {
     *current += 4;
-}
-
-fn would_block(err: &std::io::Error) -> bool {
-    err.kind() == std::io::ErrorKind::WouldBlock
-}
-fn interrupted(err: &std::io::Error) -> bool {
-    debug!("interrupted");
-    err.kind() == std::io::ErrorKind::Interrupted
 }
 
 fn validate_ip_and_port(ip_str: &str, port_str: &str) -> Result<std::net::SocketAddr, String> {
