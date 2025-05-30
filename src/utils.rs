@@ -1,15 +1,13 @@
 use quiche::Connection;
 use mio::net::{TcpStream, UdpSocket};
-use ring::rand::*;
 use std::io::{self, Read, Write};
 
 
-const MAX_DATAGRAM_SIZE: usize = 1350;
-pub fn create_quic_connection(
-    server_name: Option<&str>,
-    peer_addr: &std::net::SocketAddr,
-    socket: &UdpSocket,
-) -> Connection {
+pub const MAX_DATAGRAM_SIZE: usize = 1350;
+// Setup some tokens to allow us to identify which event is for which socket.
+pub const TCP_TOKEN: mio::Token = mio::Token(0);
+pub const UDP_TOKEN: mio::Token = mio::Token(1);
+pub fn get_quic_basic_config() -> quiche::Config {
     // Create the configuration for the QUIC connection.
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 
@@ -29,27 +27,7 @@ pub fn create_quic_connection(
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
-
-    // Generate a random source connection ID for the connection.
-    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-    SystemRandom::new().fill(&mut scid[..]).unwrap();
-
-    let scid = quiche::ConnectionId::from_ref(&scid);
-
-    // Get local address.
-    let local_addr = socket.local_addr().unwrap();
-
-    // Create a QUIC connection and initiate handshake.
-    let conn = quiche::connect(server_name, &scid, local_addr, *peer_addr, &mut config).unwrap();
-
-    info!(
-        "connecting to {:} from {:} with scid {}",
-        peer_addr,
-        socket.local_addr().unwrap(),
-        hex_dump(&scid)
-    );
-
-    conn
+    config
 }
 
 pub fn tcp_quic(
@@ -194,8 +172,7 @@ pub fn quic_tcp(
     let mut buf = [0; 65535];
 // We can (maybe) write to the connection.
     // Process all readable streams.
-    for stream_id in quic_connection.readable() {
-        while let Ok((read, fin)) = quic_connection.stream_recv(stream_id, &mut buf) {
+        while let Ok((read, fin)) = quic_connection.stream_recv(*stream_id, &mut buf) {
             debug!("received {} bytes", read);
 
             let stream_buf = &buf[..read];
@@ -243,7 +220,7 @@ pub fn quic_tcp(
                 // Close the stream
                 // quic_connection.close(true, 0x00, b"kthxbye").unwrap();
             }
-        }
+        
     }
 }
 pub fn hex_dump(buf: &[u8]) -> String {

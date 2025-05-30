@@ -16,3 +16,7 @@ ring = "0.17.14"
 [[bin]]
 name = "tcp2quic" # a TCP server -> QUIC
 path = "src/tcp2quic.rs" # Path to the binary file (optional if following the standard convention)
+
+[[bin]]
+name = "quic2tcp" # a TCP server -> QUIC
+path = "src/quic2tcp.rs" # Path to the binary file (optional if following the standard convention)

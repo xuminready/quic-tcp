@@ -10,10 +10,8 @@ use quiche::Connection;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use utils::*;
+use ring::rand::*;
 
-// Setup some tokens to allow us to identify which event is for which socket.
-const TCP_SERVER: mio::Token = mio::Token(0);
-const UDP_CLIENT: mio::Token = mio::Token(1);
 
 fn main() -> std::io::Result<()> {
     env_logger::init(); // Initialize env_logger
@@ -49,7 +47,7 @@ fn main() -> std::io::Result<()> {
 
     // Register the server with poll we can receive events for it.
     poll.registry()
-        .register(&mut tcp_server, TCP_SERVER, mio::Interest::READABLE)?;
+        .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)?;
 
     // Resolve server address.
     let peer_addr: std::net::SocketAddr = addr; //TODO replace with UDP addr
@@ -64,9 +62,29 @@ fn main() -> std::io::Result<()> {
     // the event loop.
     let mut udp_socket = mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
     poll.registry()
-        .register(&mut udp_socket, UDP_CLIENT, mio::Interest::READABLE)
+        .register(&mut udp_socket, UDP_TOKEN, mio::Interest::READABLE)
         .unwrap();
-    let mut quic_connection = create_quic_connection(Some(addr.to_string().as_str()), &peer_addr, &udp_socket);
+    let mut config = get_quic_basic_config();
+
+    // Generate a random source connection ID for the connection.
+    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+    SystemRandom::new().fill(&mut scid[..]).unwrap();
+
+    let scid = quiche::ConnectionId::from_ref(&scid);
+
+    // Get local address.
+    let local_addr = udp_socket.local_addr().unwrap();
+
+    // Create a QUIC connection and initiate handshake.
+    let mut quic_connection = quiche::connect(Some(addr.to_string().as_str()), &scid, local_addr, peer_addr, &mut config).unwrap();
+
+    info!(
+        "connecting to {:} from {:} with scid {}",
+        peer_addr,
+        udp_socket.local_addr().unwrap(),
+        hex_dump(&scid)
+    );
+
     debug!("initiate quic connection...");
 
     quic_udp(&mut quic_connection, &udp_socket);
@@ -78,12 +96,12 @@ fn main() -> std::io::Result<()> {
     let mut current_stream_id: u64 = 0;
 
     // Unique token for each incoming connection.
-    let mut unique_token: mio::Token = mio::Token(UDP_CLIENT.0 + 1);
+    let mut unique_token: mio::Token = mio::Token(UDP_TOKEN.0 + 1);
     loop {
         poll.poll(&mut events, None).unwrap();
         for event in events.iter() {
             match event.token() {
-                UDP_CLIENT =>{
+                UDP_TOKEN =>{
                     udp_quic(&mut quic_connection, &udp_socket);
                     for stream_id in quic_connection.readable(){
                         let token = streamId_token_map.get(&stream_id).unwrap();
@@ -91,7 +109,7 @@ fn main() -> std::io::Result<()> {
                         quic_tcp(tcp_stream, &mut quic_connection, &stream_id)
                     }
                 }
-                TCP_SERVER => loop {
+                TCP_TOKEN => loop {
                     // Received an event for the TCP server socket, which
                     // indicates we can accept an connection.
                     let (mut tcp_stream, address) = match tcp_server.accept() {
