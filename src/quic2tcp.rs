@@ -31,14 +31,44 @@ type ConnecId = [u8; quiche::MAX_CONN_ID_LEN];
 fn main() {
     env_logger::init(); // Initialize env_logger
 
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 4 {
+        eprintln!(
+            "Usage: {} <Local_UDP_(QUIC)Server_IP> <Local_Port> <Remote_TCP_IP> <Remote_Port>",
+            args[0]
+        );
+        return;
+    }
+    let udp_local_ip_str = &args[1];
+    let udp_local_port_str = &args[2];
+    let tcp_remote_ip_str = &args[3];
+    let tcp_remote_port_str = &args[4];
+
+    println!("UDP Local  Server: {udp_local_ip_str}:{udp_local_port_str}");
+    println!("TCP Remote Server: {tcp_remote_ip_str}:{tcp_remote_port_str}");
+
+    let udp_local_addr = match validate_ip_and_port(udp_local_ip_str, udp_local_port_str) {
+        Ok(addr) => addr,
+        Err(err) => {
+            print!("{err}");
+            return;
+        }
+    };
+    let tcp_remote_addr = match validate_ip_and_port(tcp_remote_ip_str, tcp_remote_port_str) {
+        Ok(addr) => addr,
+        Err(err) => {
+            print!("{err}");
+            return;
+        }
+    };
+
     // Setup the event loop.
     let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
-
     // Create the UDP listening socket, and register it with the event loop.
-    let mut socket = mio::net::UdpSocket::bind("127.0.0.1:4433".parse().unwrap()).unwrap();
+    let mut udp_socket = mio::net::UdpSocket::bind(udp_local_addr).unwrap();
     poll.registry()
-        .register(&mut socket, UDP_TOKEN, mio::Interest::READABLE)
+        .register(&mut udp_socket, UDP_TOKEN, mio::Interest::READABLE)
         .unwrap();
 
     // Create the configuration for the QUIC connections.
@@ -55,7 +85,7 @@ fn main() {
 
     let mut clients = ClientMap::new();
 
-    let local_addr = socket.local_addr().unwrap();
+    let local_addr = udp_socket.local_addr().unwrap();
     // Unique token for each incoming connection.
     let mut streamId_tcp_stream_map: HashMap<u64, mio::net::TcpStream> = HashMap::new();
     let mut token_streamId_map = HashMap::new();
@@ -88,7 +118,7 @@ fn main() {
                             break 'read;
                         }
 
-                        let (len, from) = match socket.recv_from(&mut buf) {
+                        let (len, from) = match udp_socket.recv_from(&mut buf) {
                             Ok(v) => v,
 
                             Err(e) => {
@@ -142,7 +172,7 @@ fn main() {
 
                                 let out = &out[..len];
 
-                                if let Err(e) = socket.send_to(out, from) {
+                                if let Err(e) = udp_socket.send_to(out, from) {
                                     if e.kind() == std::io::ErrorKind::WouldBlock {
                                         debug!("send() would block");
                                         break;
@@ -179,7 +209,7 @@ fn main() {
 
                                 let out = &out[..len];
 
-                                if let Err(e) = socket.send_to(out, from) {
+                                if let Err(e) = udp_socket.send_to(out, from) {
                                     if e.kind() == std::io::ErrorKind::WouldBlock {
                                         debug!("send() would block");
                                         break;
@@ -236,7 +266,7 @@ fn main() {
                         };
 
                         let recv_info = quiche::RecvInfo {
-                            to: socket.local_addr().unwrap(),
+                            to: udp_socket.local_addr().unwrap(),
                             from,
                         };
 
@@ -321,13 +351,13 @@ fn main() {
                     }
                 }
             }
-            
+
             // Generate outgoing QUIC packets for all active connections and send
             // them on the UDP socket, until quiche reports that there are no more
             // packets to be sent.
             for client in clients.values_mut() {
                 // flush the data to UDP socket
-                quic_udp(&mut client.conn, &socket);
+                quic_udp(&mut client.conn, &udp_socket);
             }
 
             // Garbage collect closed connections.

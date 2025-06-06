@@ -1,7 +1,9 @@
-use quiche::Connection;
 use mio::net::{TcpStream, UdpSocket};
-use std::io::{self, Read, Write};
-
+use quiche::Connection;
+use std::{
+    f32::consts::E,
+    io::{self, Read, Write},
+};
 
 pub const MAX_DATAGRAM_SIZE: usize = 1350;
 // Setup some tokens to allow us to identify which event is for which socket.
@@ -62,7 +64,7 @@ pub fn tcp_quic(
                     quic_connection
                         .stream_send(*stream_id, &buf[..n], false)
                         .unwrap();
-                }else{
+                } else {
                     error!("quic connection is not established");
                     break;
                 }
@@ -78,8 +80,6 @@ pub fn tcp_quic(
             }
         }
     }
-
-
 }
 
 pub fn quic_udp(quic_connection: &mut Connection, udp_socket: &UdpSocket) {
@@ -119,7 +119,7 @@ pub fn quic_udp(quic_connection: &mut Connection, udp_socket: &UdpSocket) {
     }
 }
 
-pub fn udp_quic(quic_connection: &mut Connection, udp_socket: &UdpSocket){
+pub fn udp_quic(quic_connection: &mut Connection, udp_socket: &UdpSocket) {
     debug!("udp -> quic");
     let mut buf = [0; 65535];
     'read: loop {
@@ -164,63 +164,59 @@ pub fn udp_quic(quic_connection: &mut Connection, udp_socket: &UdpSocket){
     }
 }
 
-pub fn quic_tcp(    
+pub fn quic_tcp(
     tcp_stream: &mut mio::net::TcpStream,
     quic_connection: &mut Connection,
-    stream_id: &u64,){
+    stream_id: &u64,
+) {
     debug!("QUIC -> TCP");
     let mut buf = [0; 65535];
-// We can (maybe) write to the connection.
+    // We can (maybe) write to the connection.
     // Process all readable streams.
-        while let Ok((read, fin)) = quic_connection.stream_recv(*stream_id, &mut buf) {
-            debug!("received {} bytes", read);
+    while let Ok((read, fin)) = quic_connection.stream_recv(*stream_id, &mut buf) {
+        debug!("received {} bytes", read);
 
-            let stream_buf = &buf[..read];
+        let stream_buf = &buf[..read];
 
-            debug!(
-                "stream {} has {} bytes (fin? {})",
-                stream_id,
-                stream_buf.len(),
-                fin
-            );
-            print!("{}", unsafe { std::str::from_utf8_unchecked(stream_buf) });
-            match tcp_stream.write(stream_buf) {
-                // We want to write the entire `DATA` buffer in a single go. If we
-                // write less we'll return a short write error (same as
-                // `io::Write::write_all` does).
-                Ok(n) if n < stream_buf.len() => {
-                    return; //Err(std::io::ErrorKind::WriteZero.into())
-                }
-                Ok(_) => {
-                    // After we've written something we'll reregister the connection
-                    // to only respond to readable events.
-                    // registry.reregister(connection, event.token(), mio::Interest::READABLE)?
-                }
-                // Would block "errors" are the OS's way of saying that the
-                // connection is not actually ready to perform this I/O operation.
-                Err(ref err) if would_block(err) => {}
-                // Got interrupted (how rude!), we'll try again.
-                Err(ref err) if interrupted(err) => {
-                    debug!("interrupted");
-                    //TODO do we really need to re-try?
-                    return quic_tcp(
-                        tcp_stream,
-                        quic_connection,
-                        &stream_id,
-                    )
-                }
-                // Other errors we'll consider fatal.
-                Err(err) => return, //Err(err),
+        debug!(
+            "stream {} has {} bytes (fin? {})",
+            stream_id,
+            stream_buf.len(),
+            fin
+        );
+        print!("{}", unsafe { std::str::from_utf8_unchecked(stream_buf) });
+        match tcp_stream.write(stream_buf) {
+            // We want to write the entire `DATA` buffer in a single go. If we
+            // write less we'll return a short write error (same as
+            // `io::Write::write_all` does).
+            Ok(n) if n < stream_buf.len() => {
+                return; //Err(std::io::ErrorKind::WriteZero.into())
             }
-
-            // The server reported that it has no more data to send, which
-            // we got the full response. Close the connection.
-            if fin {
-                info!("response received in , closing...");
-                // Close the stream
-                // quic_connection.close(true, 0x00, b"kthxbye").unwrap();
+            Ok(_) => {
+                // After we've written something we'll reregister the connection
+                // to only respond to readable events.
+                // registry.reregister(connection, event.token(), mio::Interest::READABLE)?
             }
-        
+            // Would block "errors" are the OS's way of saying that the
+            // connection is not actually ready to perform this I/O operation.
+            Err(ref err) if would_block(err) => {}
+            // Got interrupted (how rude!), we'll try again.
+            Err(ref err) if interrupted(err) => {
+                debug!("interrupted");
+                //TODO do we really need to re-try?
+                return quic_tcp(tcp_stream, quic_connection, &stream_id);
+            }
+            // Other errors we'll consider fatal.
+            Err(err) => return, //Err(err),
+        }
+
+        // The server reported that it has no more data to send, which
+        // we got the full response. Close the connection.
+        if fin {
+            info!("response received in , closing...");
+            // Close the stream
+            // quic_connection.close(true, 0x00, b"kthxbye").unwrap();
+        }
     }
 }
 pub fn hex_dump(buf: &[u8]) -> String {
@@ -236,4 +232,27 @@ pub fn would_block(err: &std::io::Error) -> bool {
 pub fn interrupted(err: &std::io::Error) -> bool {
     debug!("interrupted");
     err.kind() == std::io::ErrorKind::Interrupted
+}
+
+pub fn validate_ip_and_port(ip_str: &str, port_str: &str) -> Result<std::net::SocketAddr, String> {
+    // First, let's try parsing the IP address.
+    let ip: std::net::IpAddr = match ip_str.parse() {
+        Ok(addr) => addr,
+        Err(_) => return Err(String::from("Invalid IP address format")),
+    };
+
+    // Now, let's tackle the port.
+    let port: u16 = match port_str.parse() {
+        Ok(p) => {
+            if p > 0 && p <= 65535 {
+                p
+            } else {
+                return Err(String::from("Port number must be between 1 and 65535"));
+            }
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+
+    // If both parsing steps are successful, we can construct a SocketAddr.
+    Ok(std::net::SocketAddr::new(ip, port))
 }

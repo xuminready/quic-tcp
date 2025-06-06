@@ -7,50 +7,60 @@ use std::env::Args;
 
 use mio::net::{TcpStream, UdpSocket};
 use quiche::Connection;
+use ring::rand::*;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use utils::*;
-use ring::rand::*;
 
-
-fn main() -> std::io::Result<()> {
+fn main() {
     env_logger::init(); // Initialize env_logger
-    let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 3 {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 4 {
         eprintln!(
-            "Usage: {} <QUIC_Server_IP_ADDRESS> <PORT> <TCP_Server_IP_ADDRESS> <PORT>",
+            "Usage: {} <Remote_UDP_(QUIC)Server_IP> <Remote_Port> <Local_TCP_IP> <Local_Port>",
             args[0]
         );
-        return Err(io::Error::new(io::ErrorKind::Other, "args error"));
+        return;
     }
 
+    let udp_remote_ip_str = &args[1];
+    let udp_remote_port_str = &args[2];
+    let tcp_local_ip_str = &args[3];
+    let tcp_local_port_str = &args[4];
+
+    println!("UDP Remote Server: {udp_remote_ip_str} and Port: {udp_remote_port_str}");
+    println!("TCP Local Server: {tcp_local_ip_str} and Port: {tcp_local_port_str}");
+
+    let udp_remote_addr = match validate_ip_and_port(udp_remote_ip_str, udp_remote_port_str) {
+        Ok(addr) => addr,
+        Err(err) => {
+            print!("{err}");
+            return;
+        }
+    };
+    let tcp_local_addr = match validate_ip_and_port(tcp_local_ip_str, tcp_local_port_str) {
+        Ok(addr) => addr,
+        Err(err) => {
+            print!("{err}");
+            return;
+        }
+    };
+    // Setup the TCP server socket.
+    let mut tcp_server = mio::net::TcpListener::bind(tcp_local_addr).unwrap();
+
     // Setup the event loop.
-    let mut poll = mio::Poll::new()?;
+    let mut poll = mio::Poll::new().unwrap();
     // Create storage for events.
     let mut events = mio::Events::with_capacity(1024);
 
-    let ip_str = &args[1];
-    let port_str = &args[2];
-
-    println!(
-        "Attempting to validate IP: {} and Port: {}",
-        ip_str, port_str
-    );
-
-    // Setup the TCP server socket.
-    let addr = match validate_ip_and_port(ip_str, port_str) {
-        Ok(addr) => addr,
-        Err(err) => return Err(io::Error::new(io::ErrorKind::Other, err)),
-    };
-    let mut tcp_server = mio::net::TcpListener::bind(addr)?;
-
     // Register the server with poll we can receive events for it.
     poll.registry()
-        .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)?;
+        .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)
+        .unwrap();
 
     // Resolve server address.
-    let peer_addr: std::net::SocketAddr = addr; //TODO replace with UDP addr
+    let peer_addr: std::net::SocketAddr = udp_remote_addr; //TODO replace with UDP addr
     // Bind to INADDR_ANY or IN6ADDR_ANY depending on the IP family of the
     // server address. This is needed on macOS and BSD variants that don't
     // support binding to IN6ADDR_ANY for both v4 and v6.
@@ -76,7 +86,14 @@ fn main() -> std::io::Result<()> {
     let local_addr = udp_socket.local_addr().unwrap();
 
     // Create a QUIC connection and initiate handshake.
-    let mut quic_connection = quiche::connect(Some(addr.to_string().as_str()), &scid, local_addr, peer_addr, &mut config).unwrap();
+    let mut quic_connection = quiche::connect(
+        Some(udp_remote_addr.to_string().as_str()),
+        &scid,
+        local_addr,
+        peer_addr,
+        &mut config,
+    )
+    .unwrap();
 
     info!(
         "connecting to {:} from {:} with scid {}",
@@ -101,9 +118,9 @@ fn main() -> std::io::Result<()> {
         poll.poll(&mut events, None).unwrap();
         for event in events.iter() {
             match event.token() {
-                UDP_TOKEN =>{
+                UDP_TOKEN => {
                     udp_quic(&mut quic_connection, &udp_socket);
-                    for stream_id in quic_connection.readable(){
+                    for stream_id in quic_connection.readable() {
                         let token = streamId_token_map.get(&stream_id).unwrap();
                         let tcp_stream = token_tcp_stream_map.get_mut(token).unwrap();
                         quic_tcp(tcp_stream, &mut quic_connection, &stream_id)
@@ -124,7 +141,8 @@ fn main() -> std::io::Result<()> {
                         Err(e) => {
                             // If it was any other kind of error, something went
                             // wrong and we terminate with an error.
-                            return Err(e);
+                            eprint!("{}", e);
+                            return;
                         }
                     };
 
@@ -132,7 +150,8 @@ fn main() -> std::io::Result<()> {
 
                     let token = next(&mut unique_token);
                     poll.registry()
-                        .register(&mut tcp_stream, token, mio::Interest::READABLE)?;
+                        .register(&mut tcp_stream, token, mio::Interest::READABLE)
+                        .unwrap();
 
                     next_stream_id(&mut current_stream_id);
                     debug!("new stream id: {} for {}", current_stream_id, address);
@@ -160,7 +179,7 @@ fn main() -> std::io::Result<()> {
                             streamId_token_map.remove(&stream_id);
                         }
                         if let Some(mut tcp_stream) = token_tcp_stream_map.remove(&token) {
-                            poll.registry().deregister(&mut tcp_stream)?;
+                            poll.registry().deregister(&mut tcp_stream).unwrap();
                         }
                     }
                 }
@@ -180,27 +199,4 @@ fn next(current: &mut mio::Token) -> mio::Token {
 
 fn next_stream_id(current: &mut u64) {
     *current += 4;
-}
-
-fn validate_ip_and_port(ip_str: &str, port_str: &str) -> Result<std::net::SocketAddr, String> {
-    // First, let's try parsing the IP address.
-    let ip: std::net::IpAddr = match ip_str.parse() {
-        Ok(addr) => addr,
-        Err(_) => return Err(String::from("Invalid IP address format")),
-    };
-
-    // Now, let's tackle the port.
-    let port: u16 = match port_str.parse() {
-        Ok(p) => {
-            if p > 0 && p <= 65535 {
-                p
-            } else {
-                return Err(String::from("Port number must be between 1 and 65535"));
-            }
-        }
-        Err(_) => return Err(String::from("Invalid port number format")),
-    };
-
-    // If both parsing steps are successful, we can construct a SocketAddr.
-    Ok(std::net::SocketAddr::new(ip, port))
 }
