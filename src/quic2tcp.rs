@@ -102,7 +102,7 @@ fn main() {
         poll.poll(&mut events, timeout).unwrap();
         for event in events.iter() {
             match event.token() {
-                TCP_TOKEN => {}
+                TCP_TOKEN => {} // not used for server.
                 UDP_TOKEN => {
                     // Read incoming UDP packets from the socket and feed them to quiche,
                     // until there are no more packets to read.
@@ -293,10 +293,8 @@ fn main() {
                                 if !streamId_tcp_stream_map.contains_key(&stream_id) {
                                     let token = next(&mut unique_token);
                                     // Setup the new client socket.
-                                    let addr_str = "127.0.0.1:8000";
-                                    let addr: net::SocketAddr = addr_str.parse().unwrap();
                                     let mut tcp_stream =
-                                        mio::net::TcpStream::connect(addr).unwrap();
+                                        mio::net::TcpStream::connect(tcp_remote_addr).unwrap();
                                     poll.registry()
                                         .register(&mut tcp_stream, token, mio::Interest::READABLE)
                                         .unwrap();

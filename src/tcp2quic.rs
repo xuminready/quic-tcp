@@ -29,7 +29,7 @@ fn main() {
     let tcp_local_ip_str = &args[3];
     let tcp_local_port_str = &args[4];
 
-    println!("UDP Remote Server: {udp_remote_ip_str} and Port: {udp_remote_port_str}");
+    println!("UDP(QUIC) Remote Server: {udp_remote_ip_str} and Port: {udp_remote_port_str}");
     println!("TCP Local Server: {tcp_local_ip_str} and Port: {tcp_local_port_str}");
 
     let udp_remote_addr = match validate_ip_and_port(udp_remote_ip_str, udp_remote_port_str) {
@@ -104,7 +104,7 @@ fn main() {
 
     debug!("initiate quic connection...");
 
-    quic_udp(&mut quic_connection, &udp_socket);
+    let _ = quic_udp(&mut quic_connection, &udp_socket);
 
     // Map of `Token` -> `TcpStream`.
     let mut token_tcp_stream_map = HashMap::new();
@@ -119,11 +119,11 @@ fn main() {
         for event in events.iter() {
             match event.token() {
                 UDP_TOKEN => {
-                    udp_quic(&mut quic_connection, &udp_socket);
+                    let _ = udp_quic(&mut quic_connection, &udp_socket);
                     for stream_id in quic_connection.readable() {
                         let token = streamId_token_map.get(&stream_id).unwrap();
                         let tcp_stream = token_tcp_stream_map.get_mut(token).unwrap();
-                        quic_tcp(tcp_stream, &mut quic_connection, &stream_id)
+                        let _ = quic_tcp(tcp_stream, &mut quic_connection, &stream_id);
                     }
                 }
                 TCP_TOKEN => loop {
@@ -156,17 +156,20 @@ fn main() {
                     next_stream_id(&mut current_stream_id);
                     debug!("new stream id: {} for {}", current_stream_id, address);
                     streamId_token_map.insert(current_stream_id.clone(), token.clone());
-                    token_streamId_map.insert(token.clone(), current_stream_id.clone());
+                    token_streamId_map.insert(token.clone(), current_stream_id);
 
                     token_tcp_stream_map.insert(token, tcp_stream);
                 },
                 token => {
                     // received an event for a TCP connection.
                     let done = if let Some(tcp_stream) = token_tcp_stream_map.get_mut(&token) {
-                        let mut is_tcp_stream_closed = false;
                         let stream_id = token_streamId_map.get(&token).unwrap();
-                        tcp_quic(tcp_stream, &mut quic_connection, stream_id);
-                        false
+                        let is_closed = match tcp_quic(tcp_stream, &mut quic_connection, stream_id)
+                        {
+                            Ok(result) => result,
+                            Err(e) => false,
+                        };
+                        is_closed
                         //TODO return the TCP connection status remove disconnection and update hashmap
                     } else {
                         // Sporadic events happen, we can safely ignore them.
