@@ -28,7 +28,7 @@ struct Client {
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 type ConnecId = [u8; quiche::MAX_CONN_ID_LEN];
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init(); // Initialize env_logger
 
     let args: Vec<String> = std::env::args().collect();
@@ -37,7 +37,7 @@ fn main() {
             "Usage: {} <Local_UDP_(QUIC)Server_IP> <Local_Port> <Remote_TCP_IP> <Remote_Port>",
             args[0]
         );
-        return;
+        return Ok(());
     }
     let udp_local_ip_str = &args[1];
     let udp_local_port_str = &args[2];
@@ -47,20 +47,8 @@ fn main() {
     println!("UDP Local  Server: {udp_local_ip_str}:{udp_local_port_str}");
     println!("TCP Remote Server: {tcp_remote_ip_str}:{tcp_remote_port_str}");
 
-    let udp_local_addr = match validate_ip_and_port(udp_local_ip_str, udp_local_port_str) {
-        Ok(addr) => addr,
-        Err(err) => {
-            print!("{err}");
-            return;
-        }
-    };
-    let tcp_remote_addr = match validate_ip_and_port(tcp_remote_ip_str, tcp_remote_port_str) {
-        Ok(addr) => addr,
-        Err(err) => {
-            print!("{err}");
-            return;
-        }
-    };
+    let udp_local_addr = validate_ip_and_port(udp_local_ip_str, udp_local_port_str)?;
+    let tcp_remote_addr = validate_ip_and_port(tcp_remote_ip_str, tcp_remote_port_str)?;
 
     // Setup the event loop.
     let mut poll = mio::Poll::new().unwrap();

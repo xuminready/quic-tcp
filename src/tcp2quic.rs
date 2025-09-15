@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use utils::*;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init(); // Initialize env_logger
 
     let args: Vec<String> = std::env::args().collect();
@@ -21,7 +21,7 @@ fn main() {
             "Usage: {} <Remote_UDP_(QUIC)Server_IP> <Remote_Port> <Local_TCP_IP> <Local_Port>",
             args[0]
         );
-        return;
+        return Ok(());
     }
 
     let udp_remote_ip_str = &args[1];
@@ -32,28 +32,16 @@ fn main() {
     println!("UDP(QUIC) Remote Server: {udp_remote_ip_str} and Port: {udp_remote_port_str}");
     println!("TCP Local Server: {tcp_local_ip_str} and Port: {tcp_local_port_str}");
 
-    let udp_remote_addr = match validate_ip_and_port(udp_remote_ip_str, udp_remote_port_str) {
-        Ok(addr) => addr,
-        Err(err) => {
-            print!("{err}");
-            return;
-        }
-    };
-    let tcp_local_addr = match validate_ip_and_port(tcp_local_ip_str, tcp_local_port_str) {
-        Ok(addr) => addr,
-        Err(err) => {
-            print!("{err}");
-            return;
-        }
-    };
-    // Setup the TCP server socket.
-    let mut tcp_server = mio::net::TcpListener::bind(tcp_local_addr).unwrap();
+    let udp_remote_addr = validate_ip_and_port(udp_remote_ip_str, udp_remote_port_str)?;
+    let tcp_local_addr = validate_ip_and_port(tcp_local_ip_str, tcp_local_port_str)?;
 
     // Setup the event loop.
     let mut poll = mio::Poll::new().unwrap();
     // Create storage for events.
     let mut events = mio::Events::with_capacity(1024);
 
+    // Setup the TCP server socket.
+    let mut tcp_server = mio::net::TcpListener::bind(tcp_local_addr).unwrap();
     // Register the server with poll we can receive events for it.
     poll.registry()
         .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)
@@ -119,11 +107,22 @@ fn main() {
         for event in events.iter() {
             match event.token() {
                 UDP_TOKEN => {
+                    // Received data from UDP, send it to quic
                     let _ = udp_quic(&mut quic_connection, &udp_socket);
+                    // send the quic data to TCP
                     for stream_id in quic_connection.readable() {
                         let token = streamId_token_map.get(&stream_id).unwrap();
                         let tcp_stream = token_tcp_stream_map.get_mut(token).unwrap();
-                        let _ = quic_tcp(tcp_stream, &mut quic_connection, &stream_id);
+                        let done = quic_tcp(tcp_stream, &mut quic_connection, &stream_id)?;
+                        {
+                            close_connection_by_id(
+                                stream_id,
+                                &mut token_streamId_map,
+                                &mut streamId_token_map,
+                                &mut token_tcp_stream_map,
+                                &mut poll,
+                            );
+                        }
                     }
                 }
                 TCP_TOKEN => loop {
@@ -142,7 +141,7 @@ fn main() {
                             // If it was any other kind of error, something went
                             // wrong and we terminate with an error.
                             eprint!("{}", e);
-                            return;
+                            return Ok(());
                         }
                     };
 
@@ -153,10 +152,10 @@ fn main() {
                         .register(&mut tcp_stream, token, mio::Interest::READABLE)
                         .unwrap();
 
-                    next_stream_id(&mut current_stream_id);
-                    debug!("new stream id: {} for {}", current_stream_id, address);
-                    streamId_token_map.insert(current_stream_id.clone(), token.clone());
-                    token_streamId_map.insert(token.clone(), current_stream_id);
+                    let stream_id = next_stream_id(&mut current_stream_id);
+                    debug!("new stream id: {} for {}", stream_id, address);
+                    streamId_token_map.insert(stream_id.clone(), token.clone());
+                    token_streamId_map.insert(token.clone(), stream_id);
 
                     token_tcp_stream_map.insert(token, tcp_stream);
                 },
@@ -177,13 +176,13 @@ fn main() {
                     };
                     if done {
                         debug!("done, close tcp stream");
-                        // remove from the hashmap
-                        if let Some(stream_id) = token_streamId_map.remove(&token) {
-                            streamId_token_map.remove(&stream_id);
-                        }
-                        if let Some(mut tcp_stream) = token_tcp_stream_map.remove(&token) {
-                            poll.registry().deregister(&mut tcp_stream).unwrap();
-                        }
+                        close_connection_by_token(
+                            token,
+                            &mut token_streamId_map,
+                            &mut streamId_token_map,
+                            &mut token_tcp_stream_map,
+                            &mut poll,
+                        );
                     }
                 }
             }
@@ -194,12 +193,45 @@ fn main() {
     }
 }
 
+fn close_connection_by_id(
+    stream_id: u64,
+    token_stream_id_map: &mut HashMap<mio::Token, u64>,
+    stream_id_token_map: &mut HashMap<u64, mio::Token>,
+    token_tcp_stream_map: &mut HashMap<mio::Token, mio::net::TcpStream>,
+    poll: &mut mio::Poll,
+) {
+    if let Some(token) = stream_id_token_map.remove(&stream_id) {
+        token_stream_id_map.remove(&token);
+        if let Some(mut tcp_stream) = token_tcp_stream_map.remove(&token) {
+            tcp_stream.shutdown(std::net::Shutdown::Both).unwrap();
+            poll.registry().deregister(&mut tcp_stream).unwrap();
+        }
+    }
+}
+
+fn close_connection_by_token(
+    token: mio::Token,
+    token_stream_id_map: &mut HashMap<mio::Token, u64>,
+    stream_id_token_map: &mut HashMap<u64, mio::Token>,
+    token_tcp_stream_map: &mut HashMap<mio::Token, mio::net::TcpStream>,
+    poll: &mut mio::Poll,
+) {
+    if let Some(mut tcp_stream) = token_tcp_stream_map.remove(&token) {
+        tcp_stream.shutdown(std::net::Shutdown::Both).unwrap();
+        poll.registry().deregister(&mut tcp_stream).unwrap();
+    }
+    if let Some(stream_id) = token_stream_id_map.remove(&token) {
+        stream_id_token_map.remove(&stream_id);
+    }
+}
 fn next(current: &mut mio::Token) -> mio::Token {
     let next = current.0;
     current.0 += 1;
     mio::Token(next)
 }
 
-fn next_stream_id(current: &mut u64) {
+fn next_stream_id(current: &mut u64) -> u64 {
+    let next = *current;
     *current += 4;
+    next
 }

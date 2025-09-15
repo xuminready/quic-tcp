@@ -41,9 +41,6 @@ pub fn tcp_quic(
     let mut connection_closed = false;
     let mut buf = [0; 65535];
 
-    let remote_addr = tcp_stream.peer_addr().unwrap();
-    println!("Remote address: {}", remote_addr);
-
     'read: loop {
         let len = match tcp_stream.read(&mut buf) {
             Ok(v) => v,
@@ -53,8 +50,8 @@ pub fn tcp_quic(
             Err(ref err) if interrupted(err) => continue,
             // Other errors we'll consider fatal.
             Err(err) => {
-                debug!("tcp recv() failed: {:?}", err);
-                return Err(err);
+                error!("tcp recv() failed: {:?}", err);
+                continue;
             }
         };
         // Reading 0 bytes means the other side has closed the
@@ -76,7 +73,10 @@ pub fn tcp_quic(
             error!("quic connection is not established");
             break;
         }
-        if connection_closed { break };
+        if connection_closed {
+            debug!("connection closed");
+            break;
+        };
     }
     Ok(connection_closed)
 }
@@ -221,9 +221,9 @@ pub fn quic_tcp(
         // The server reported that it has no more data to send, which
         // we got the full response. Close the connection.
         if fin {
-            info!("response received in , closing...");
-            // Close the stream
-            quic_connection.close(true, 0x00, b"kthxbye").unwrap();
+            info!("fin response received in , closing...");
+            // don't close quic_connection, only close stream
+            // quic_connection.close(true, 0x00, b"kthxbye").unwrap();
             break 'recv;
         }
     }
