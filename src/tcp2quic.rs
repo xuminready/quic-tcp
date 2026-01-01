@@ -95,35 +95,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = quic_udp(&mut quic_connection, &udp_socket);
 
     // Map of `Token` -> `TcpStream`.
-    let mut token_tcp_stream_map = HashMap::new();
-    let mut streamId_token_map = HashMap::new();
-    let mut token_streamId_map = HashMap::new();
+    let mut stream_id_tcp_stream_map = HashMap::new();
+    let mut token_stream_id_map = HashMap::new();
     let mut current_stream_id: u64 = 0;
 
     // Unique token for each incoming connection.
     let mut unique_token: mio::Token = mio::Token(UDP_TOKEN.0 + 1);
     loop {
-        poll.poll(&mut events, None).unwrap();
+        poll.poll(&mut events, quic_connection.timeout()).unwrap();
         for event in events.iter() {
             match event.token() {
                 UDP_TOKEN => {
                     // Received data from UDP, send it to quic
-                    let _ = udp_quic(&mut quic_connection, &udp_socket);
+                    let _ = udp_quic(
+                        &mut quic_connection,
+                        &udp_socket,
+                        &mut stream_id_tcp_stream_map,
+                    );
                     // send the quic data to TCP
-                    for stream_id in quic_connection.readable() {
-                        let token = streamId_token_map.get(&stream_id).unwrap();
-                        let tcp_stream = token_tcp_stream_map.get_mut(token).unwrap();
-                        let done = quic_tcp(tcp_stream, &mut quic_connection, &stream_id)?;
-                        {
-                            close_connection_by_id(
-                                stream_id,
-                                &mut token_streamId_map,
-                                &mut streamId_token_map,
-                                &mut token_tcp_stream_map,
-                                &mut poll,
-                            );
-                        }
-                    }
+                    // Process all readable streams.
+                    // for stream_id in quic_connection.readable() {
+                    //     eprintln!("🔴stream_id: {} 🔴", stream_id);
+                    //     let tcp_stream = stream_id_tcp_stream_map.get_mut(&stream_id).unwrap();
+                    //     let done = quic_tcp(tcp_stream, &mut quic_connection, &stream_id)?;
+                    // if done {
+                    // TODO?
+                    // close_connection_by_id(
+                    //     stream_id,
+                    //     &mut token_streamId_map,
+                    //     &mut streamId_token_map,
+                    //     &mut token_tcp_stream_map,
+                    //     &mut poll,
+                    // );
+                    // }
+                    // }
                 }
                 TCP_TOKEN => loop {
                     // Received an event for the TCP server socket, which
@@ -153,18 +158,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap();
 
                     let stream_id = next_stream_id(&mut current_stream_id);
-                    debug!("new stream id: {} for {}", stream_id, address);
-                    streamId_token_map.insert(stream_id.clone(), token.clone());
-                    token_streamId_map.insert(token.clone(), stream_id);
+                    debug!("🟡 new stream id: {} for {} 🟡", stream_id, address);
+                    token_stream_id_map.insert(token.clone(), stream_id.clone());
 
-                    token_tcp_stream_map.insert(token, tcp_stream);
+                    stream_id_tcp_stream_map.insert(stream_id, tcp_stream);
                 },
                 token => {
                     // received an event for a TCP connection.
-                    let done = if let Some(tcp_stream) = token_tcp_stream_map.get_mut(&token) {
-                        let stream_id = token_streamId_map.get(&token).unwrap();
-                        let is_closed = match tcp_quic(tcp_stream, &mut quic_connection, stream_id)
-                        {
+                    let done = if let Some(stream_id) = token_stream_id_map.get(&token) {
+                        let tcp_stream = stream_id_tcp_stream_map.get_mut(stream_id).unwrap();
+                        let is_closed = match tcp_quic(
+                            tcp_stream,
+                            &mut quic_connection,
+                            stream_id,
+                            &udp_socket,
+                        ) {
                             Ok(result) => result,
                             Err(e) => false,
                         };
@@ -175,12 +183,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         false
                     };
                     if done {
-                        debug!("done, close tcp stream");
+                        debug!("🟢 done, close tcp stream");
                         close_connection_by_token(
                             token,
-                            &mut token_streamId_map,
-                            &mut streamId_token_map,
-                            &mut token_tcp_stream_map,
+                            &mut token_stream_id_map,
+                            &mut stream_id_tcp_stream_map,
                             &mut poll,
                         );
                     }
@@ -193,35 +200,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn close_connection_by_id(
-    stream_id: u64,
-    token_stream_id_map: &mut HashMap<mio::Token, u64>,
-    stream_id_token_map: &mut HashMap<u64, mio::Token>,
-    token_tcp_stream_map: &mut HashMap<mio::Token, mio::net::TcpStream>,
-    poll: &mut mio::Poll,
-) {
-    if let Some(token) = stream_id_token_map.remove(&stream_id) {
-        token_stream_id_map.remove(&token);
-        if let Some(mut tcp_stream) = token_tcp_stream_map.remove(&token) {
-            tcp_stream.shutdown(std::net::Shutdown::Both).unwrap();
-            poll.registry().deregister(&mut tcp_stream).unwrap();
-        }
-    }
-}
-
 fn close_connection_by_token(
     token: mio::Token,
     token_stream_id_map: &mut HashMap<mio::Token, u64>,
-    stream_id_token_map: &mut HashMap<u64, mio::Token>,
-    token_tcp_stream_map: &mut HashMap<mio::Token, mio::net::TcpStream>,
+    stream_id_tcp_stream_map: &mut HashMap<u64, mio::net::TcpStream>,
     poll: &mut mio::Poll,
 ) {
-    if let Some(mut tcp_stream) = token_tcp_stream_map.remove(&token) {
-        tcp_stream.shutdown(std::net::Shutdown::Both).unwrap();
-        poll.registry().deregister(&mut tcp_stream).unwrap();
-    }
+    debug!("🟢 close_connection_by_token 🟢");
     if let Some(stream_id) = token_stream_id_map.remove(&token) {
-        stream_id_token_map.remove(&stream_id);
+        debug!("🟢 remove stream_id {}", stream_id);
+        if let Some(mut tcp_stream) = stream_id_tcp_stream_map.remove(&stream_id) {
+            tcp_stream.shutdown(std::net::Shutdown::Both).unwrap();
+            poll.registry().deregister(&mut tcp_stream).unwrap();
+        }
     }
 }
 fn next(current: &mut mio::Token) -> mio::Token {

@@ -1,6 +1,8 @@
+use core::time;
 use mio::net::{TcpStream, UdpSocket};
 use quiche::Connection;
 use std::{
+    collections::HashMap,
     f32::consts::E,
     io::{self, Read, Write},
 };
@@ -36,12 +38,25 @@ pub fn tcp_quic(
     tcp_stream: &mut mio::net::TcpStream,
     quic_connection: &mut Connection,
     stream_id: &u64,
+    udp_socket: &UdpSocket,
 ) -> io::Result<bool> {
     debug!("TCP -> QUIC");
-    let mut connection_closed = false;
-    let mut buf = [0; 65535];
+    let mut is_done = false;
+    let mut buf = [0; 13500];
 
     'read: loop {
+        if let Ok(capacity) = quic_connection.stream_capacity(*stream_id) {
+            debug!("quic stream_capacity: {}", capacity);
+            if capacity < 13500 {
+                //TODO improve when the steam capacity is smaller than buf size.
+                break;
+            }
+        } else {
+            debug!(
+                "quic stream_capacity: None, is stream established? {}",
+                quic_connection.is_established()
+            );
+        }
         let len = match tcp_stream.read(&mut buf) {
             Ok(v) => v,
             // Would block "errors" are the OS's way of saying that the
@@ -50,35 +65,53 @@ pub fn tcp_quic(
             Err(ref err) if interrupted(err) => continue,
             // Other errors we'll consider fatal.
             Err(err) => {
-                error!("tcp recv() failed: {:?}", err);
+                error!("tcp read() failed: {:?}", err);
                 continue;
             }
         };
         // Reading 0 bytes means the other side has closed the
         // connection or is done writing, then so are we.
-        connection_closed = len == 0;
+        is_done = len == 0;
         debug!("tcp recv len:{len}");
         if let Ok(str_buf) = std::str::from_utf8(&buf) {
             debug!("Received data: {}", str_buf.trim_end());
         } else {
-            debug!("Received (none UTF-8) data: {:?}", buf);
+            debug!("Received (none UTF-8) data len: {}", len);
         }
         if quic_connection.is_established() {
             debug!("send TCP data to a quic stream");
             // TCP->QUIC
-            quic_connection
-                .stream_send(*stream_id, &buf[..len], connection_closed)
-                .unwrap();
+            match quic_connection.stream_send(*stream_id, &buf[..len], false) {
+                Ok(quic_sent) => {
+                    println!(
+                        "Successfully sent {} bytes on stream {}",
+                        quic_sent, stream_id
+                    );
+                    if quic_sent != len {
+                        eprintln!(
+                            "🔴🔴🔴🔴🔴🔴🔴🔴 data lost!🔴🔴🔴🔴 tcp read {len}, quic sent {quic_sent}"
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "🔴 ERROR: Failed to send data on stream {}: {:?}",
+                        stream_id, e
+                    );
+                }
+            }
         } else {
-            error!("quic connection is not established");
+            error!("🔴🔴🔴quic connection is not established");
             break;
         }
-        if connection_closed {
+        break;
+        let _ = quic_udp(quic_connection, udp_socket);
+        if is_done {
             debug!("connection closed");
             break;
         };
     }
-    Ok(connection_closed)
+    Ok(is_done)
 }
 
 /// Returns `true` if the connection is done.
@@ -91,12 +124,12 @@ pub fn quic_udp(quic_connection: &mut Connection, udp_socket: &UdpSocket) -> io:
         let (write, send_info) = match quic_connection.send(&mut out) {
             Ok(v) => v,
             Err(quiche::Error::Done) => {
-                debug!("done writing");
+                debug!("quic done writing");
                 break;
             }
 
             Err(e) => {
-                error!("send failed: {:?}", e);
+                error!("quic send failed: {:?}", e);
                 quic_connection.close(false, 0x1, b"fail").ok();
                 break;
             }
@@ -108,11 +141,11 @@ pub fn quic_udp(quic_connection: &mut Connection, udp_socket: &UdpSocket) -> io:
                 break;
             }
 
-            error!("send() failed: {:?}", e);
+            error!("udp send() failed: {:?}", e);
             return Err(e);
         }
 
-        debug!("written {}", write);
+        debug!("quic_udp written {}", write);
     }
     if quic_connection.is_closed() {
         info!("connection closed, {:?}", quic_connection.stats());
@@ -122,7 +155,11 @@ pub fn quic_udp(quic_connection: &mut Connection, udp_socket: &UdpSocket) -> io:
 }
 
 /// Returns `true` if the connection is done.
-pub fn udp_quic(quic_connection: &mut Connection, udp_socket: &UdpSocket) -> io::Result<bool> {
+pub fn udp_quic(
+    quic_connection: &mut Connection,
+    udp_socket: &UdpSocket,
+    stream_id_tcp_stream_map: &mut HashMap<u64, mio::net::TcpStream>,
+) -> io::Result<bool> {
     debug!("udp -> quic");
     let mut buf = [0; 65535];
     'read: loop {
@@ -136,12 +173,10 @@ pub fn udp_quic(quic_connection: &mut Connection, udp_socket: &UdpSocket) -> io:
                     debug!("recv() would block");
                     break 'read;
                 }
-                error!("recv() failed: {:?}", e);
+                error!("udp recv() failed: {:?}", e);
                 return Err(e);
             }
         };
-
-        debug!("got {} bytes", len);
 
         let recv_info = quiche::RecvInfo {
             to: udp_socket.local_addr().unwrap(),
@@ -152,12 +187,16 @@ pub fn udp_quic(quic_connection: &mut Connection, udp_socket: &UdpSocket) -> io:
         let read = match quic_connection.recv(&mut buf[..len], recv_info) {
             Ok(v) => v,
             Err(e) => {
-                error!("recv failed: {:?}", e);
+                error!("quic recv failed: {:?}", e);
                 continue 'read;
             }
         };
-
-        debug!("processed {} bytes", read);
+        for stream_id in quic_connection.readable() {
+            eprintln!("🔴stream_id: {} 🔴", stream_id);
+            let tcp_stream = stream_id_tcp_stream_map.get_mut(&stream_id).unwrap();
+            let _ = quic_tcp(tcp_stream, quic_connection, &stream_id)?;
+        }
+        debug!("processed {read} bytes");
     }
 
     debug!("done reading");
@@ -178,12 +217,12 @@ pub fn quic_tcp(
     let mut buf = [0; 65535];
     let fin = false;
     // We can (maybe) write to the connection.
-    // Process all readable streams.
+    // Process one readable streams.
     'recv: loop {
         let (read, fin) = match quic_connection.stream_recv(*stream_id, &mut buf) {
             Ok(v) => v,
             Err(e) => {
-                error!("{} recv failed: {:?}", quic_connection.trace_id(), e);
+                error!("{} quic recv failed: {:?}", quic_connection.trace_id(), e);
                 break 'recv;
             }
         };
@@ -197,14 +236,18 @@ pub fn quic_tcp(
             stream_buf.len(),
             fin
         );
-
+        if let Ok(str_buf) = std::str::from_utf8(&stream_buf) {
+            debug!("TCP write data: {}", str_buf.trim_end());
+        } else {
+            debug!("TCP write (none UTF-8) data len: {}", read);
+        }
         match tcp_stream.write(stream_buf) {
             // We want to write the entire `DATA` buffer in a single go. If we
             // write less we'll return a short write error (same as
             // `io::Write::write_all` does).
             Ok(n) if n < stream_buf.len() => return Err(std::io::ErrorKind::WriteZero.into()),
             Ok(n) => {
-                debug!("wrote {} bytes", n);
+                debug!("TCP wrote {} bytes", n);
             }
             // Would block "errors" are the OS's way of saying that the
             // connection is not actually ready to perform this I/O operation.
@@ -215,7 +258,10 @@ pub fn quic_tcp(
                 break 'recv;
             }
             // Other errors we'll consider fatal.
-            Err(err) => return Err(err),
+            Err(err) => {
+                error!("tcp write() failed: {:?}", err);
+                return Err(err);
+            }
         }
 
         // The server reported that it has no more data to send, which

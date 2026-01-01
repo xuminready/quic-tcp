@@ -10,7 +10,7 @@ use mio::Token;
 use mio::net::{TcpStream, UdpSocket};
 use quiche::Connection;
 use ring::rand::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, hash_set};
 use std::io::{self, Read, Write};
 use utils::*;
 
@@ -61,12 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create the configuration for the QUIC connections.
     let mut config = get_quic_basic_config();
-    config
-        .load_cert_chain_from_pem_file("/home/xuminready/quiche/quiche/examples/cert.crt")
-        .unwrap();
-    config
-        .load_priv_key_from_pem_file("/home/xuminready/quiche/quiche/examples/cert.key")
-        .unwrap();
+    config.load_cert_chain_from_pem_file("cert.crt").unwrap();
+    config.load_priv_key_from_pem_file("cert.key").unwrap();
     config.enable_early_data();
     let rng: SystemRandom = SystemRandom::new();
     let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
@@ -82,6 +78,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = [0; 65535];
     // Unique token for each incoming connection.
     let mut unique_token: mio::Token = mio::Token(UDP_TOKEN.0 + 1);
+    let mut unfinished_stream_ids = HashSet::new();
+
     loop {
         // Find the shorter timeout from all the active connections.
         //
@@ -90,8 +88,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         poll.poll(&mut events, timeout).unwrap();
         for event in events.iter() {
             match event.token() {
-                TCP_TOKEN => {} // not used for server.
+                TCP_TOKEN => {
+                    error!("TCP token");
+                } // not used for quic server.
                 UDP_TOKEN => {
+                    error!("UDP token");
                     // Read incoming UDP packets from the socket and feed them to quiche,
                     // until there are no more packets to read.
                     'read: loop {
@@ -274,6 +275,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Handle writable streams.
                             for stream_id in client.conn.writable() {
                                 handle_writable(client, stream_id);
+
+                                if let Some(tcp_stream) =
+                                    streamId_tcp_stream_map.get_mut(&stream_id)
+                                    && unfinished_stream_ids.contains(&stream_id)
+                                {
+                                    if let Ok(is_done) = tcp_quic(
+                                        tcp_stream,
+                                        &mut client.conn,
+                                        &stream_id,
+                                        &udp_socket,
+                                    ) {
+                                        if is_done {
+                                            unfinished_stream_ids.remove(&stream_id);
+                                        }
+                                    }
+                                }
                             }
                             // Process all readable streams.
                             for stream_id in client.conn.readable() {
@@ -307,6 +324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 token => {
+                    error!("TCP client Token");
                     // received an event for a TCP connection.
                     let done = if let Some(stream_id) = token_streamId_map.get_mut(&token) {
                         let mut is_tcp_stream_closed = false;
@@ -318,7 +336,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let scid = token_scid_map.get(&token).unwrap();
                         let mut client = clients.get_mut(&scid).unwrap();
 
-                        tcp_quic(&mut tcp_stream, &mut client.conn, stream_id);
+                        if let Ok(is_done) =
+                            tcp_quic(&mut tcp_stream, &mut client.conn, stream_id, &udp_socket)
+                        {
+                            if is_done {
+                                unfinished_stream_ids.remove(stream_id);
+                            } else {
+                                unfinished_stream_ids.insert(stream_id.clone());
+                            }
+                        }
                         false
                         //TODO return the TCP connection status remove disconnection and update hashmap
                     } else {
@@ -343,7 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // packets to be sent.
             for client in clients.values_mut() {
                 // flush the data to UDP socket
-                quic_udp(&mut client.conn, &udp_socket);
+                let _ = quic_udp(&mut client.conn, &udp_socket);
             }
 
             // Garbage collect closed connections.
