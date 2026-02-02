@@ -4,14 +4,14 @@ extern crate log;
 mod utils;
 
 use std::env::Args;
+use std::io::Write;
 use std::net;
 
 use mio::Token;
 use mio::net::{TcpStream, UdpSocket};
 use quiche::Connection;
 use ring::rand::*;
-use std::collections::{HashMap, HashSet, hash_set};
-use std::io::{self, Read, Write};
+use std::collections::{HashMap, HashSet};
 use utils::*;
 
 struct PartialResponse {
@@ -89,10 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for event in events.iter() {
             match event.token() {
                 TCP_TOKEN => {
-                    error!("TCP token");
-                } // not used for quic server.
+                    unreachable!(); // not used for quic server.
+                }
                 UDP_TOKEN => {
-                    error!("UDP token");
+                    info!("UDP server readable event");
                     // Read incoming UDP packets from the socket and feed them to quiche,
                     // until there are no more packets to read.
                     'read: loop {
@@ -290,6 +290,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             unfinished_stream_ids.remove(&stream_id);
                                         }
                                     }
+                                    // Handle quic to TCP, however, the TCP might not writealbe.
+                                     quic_tcp(tcp_stream, &mut client.conn, &stream_id);
                                 }
                             }
                             // Process all readable streams.
@@ -298,10 +300,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if !streamId_tcp_stream_map.contains_key(&stream_id) {
                                     let token = next(&mut unique_token);
                                     // Setup the new client socket.
+                                    info!("Create a new TCP connection for stream id{stream_id}");
                                     let mut tcp_stream =
                                         mio::net::TcpStream::connect(tcp_remote_addr).unwrap();
                                     poll.registry()
-                                        .register(&mut tcp_stream, token, mio::Interest::READABLE)
+                                        .register(
+                                            &mut tcp_stream,
+                                            token,
+                                            mio::Interest::READABLE.add(mio::Interest::WRITABLE),
+                                        )
                                         .unwrap();
                                     streamId_tcp_stream_map.insert(stream_id.clone(), tcp_stream);
                                     token_streamId_map.insert(token.clone(), stream_id.clone());
@@ -313,53 +320,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // fixed_size_array[..cid_slice.len()].copy_from_slice(cid_slice);
                                     token_scid_map.insert(token.clone(), scid);
                                 }
-                                if let Some(mut tcp_stream) =
-                                    streamId_tcp_stream_map.get_mut(&stream_id)
-                                {
-                                    quic_tcp(tcp_stream, &mut client.conn, &stream_id);
-                                }
+                                // if let Some(mut tcp_stream) =
+                                //     streamId_tcp_stream_map.get_mut(&stream_id)
+                                // {
+                                //     quic_tcp(tcp_stream, &mut client.conn, &stream_id);
+                                // }
                             }
                             debug!("Done for handle stream!!!");
+                        }else {
+                            error!("Not early data neither established");
                         }
                     }
                 }
                 token => {
                     error!("TCP client Token");
-                    // received an event for a TCP connection.
-                    let done = if let Some(stream_id) = token_streamId_map.get_mut(&token) {
-                        let mut is_tcp_stream_closed = false;
-                        let mut tcp_stream = streamId_tcp_stream_map.get_mut(&stream_id).unwrap();
-                        // let cid_slice: &mut [u8; 20] = token_scid_map.get_mut(&token).unwrap();
-
-                        // let cid_slice: [u8; quiche::MAX_CONN_ID_LEN] = [0; quiche::MAX_CONN_ID_LEN];
-                        // let scid = quiche::ConnectionId::from_vec(cid_slice.to_vec());
-                        let scid = token_scid_map.get(&token).unwrap();
-                        let mut client = clients.get_mut(&scid).unwrap();
-
-                        if let Ok(is_done) =
-                            tcp_quic(&mut tcp_stream, &mut client.conn, stream_id, &udp_socket)
-                        {
-                            if is_done {
-                                unfinished_stream_ids.remove(stream_id);
-                            } else {
-                                unfinished_stream_ids.insert(stream_id.clone());
-                            }
+                    if event.is_writable() {
+                        info!("TCP client is writaible");
+                        if let Some(stream_id) = token_streamId_map.get_mut(&token) {
+                            let mut tcp_stream =
+                                streamId_tcp_stream_map.get_mut(&stream_id).unwrap();
+                            let scid = token_scid_map.get(&token).unwrap();
+                            let mut client = clients.get_mut(&scid).unwrap();
+                            quic_tcp(tcp_stream, &mut client.conn, &stream_id);
                         }
-                        false
-                        //TODO return the TCP connection status remove disconnection and update hashmap
-                    } else {
-                        // Sporadic events happen, we can safely ignore them.
-                        false
-                    };
-                    if done {
-                        debug!("done, close tcp stream");
-                        // remove from the hashmap
-                        // if let Some(stream_id) = token_streamId_map.remove(&token) {
-                        //     streamId_token_map.remove(&stream_id);
-                        // }
-                        // if let Some(mut tcp_stream) = token_tcp_stream_map.remove(&token) {
-                        //     poll.registry().deregister(&mut tcp_stream)?;
-                        // }
+                    }
+                    if event.is_readable() {
+                        info!("TCP client is readable");
+                        // received an event for a TCP connection.
+                        let done = if let Some(stream_id) = token_streamId_map.get_mut(&token) {
+                            let mut is_tcp_stream_closed = false;
+                            let mut tcp_stream =
+                                streamId_tcp_stream_map.get_mut(&stream_id).unwrap();
+                            // let cid_slice: &mut [u8; 20] = token_scid_map.get_mut(&token).unwrap();
+
+                            // let cid_slice: [u8; quiche::MAX_CONN_ID_LEN] = [0; quiche::MAX_CONN_ID_LEN];
+                            // let scid = quiche::ConnectionId::from_vec(cid_slice.to_vec());
+                            let scid = token_scid_map.get(&token).unwrap();
+                            let mut client = clients.get_mut(&scid).unwrap();
+
+                            if let Ok(is_done) =
+                                tcp_quic(&mut tcp_stream, &mut client.conn, stream_id, &udp_socket)
+                            {
+                                if is_done {
+                                    unfinished_stream_ids.remove(stream_id);
+                                } else {
+                                    unfinished_stream_ids.insert(stream_id.clone());
+                                }
+                            }
+                            false
+                            //TODO return the TCP connection status remove disconnection and update hashmap
+                        } else {
+                            // Sporadic events happen, we can safely ignore them.
+                            false
+                        };
+                        if done {
+                            debug!("done, close tcp stream");
+                            // remove from the hashmap
+                            // if let Some(stream_id) = token_streamId_map.remove(&token) {
+                            //     streamId_token_map.remove(&stream_id);
+                            // }
+                            // if let Some(mut tcp_stream) = token_tcp_stream_map.remove(&token) {
+                            //     poll.registry().deregister(&mut tcp_stream)?;
+                            // }
+                        }
                     }
                 }
             }

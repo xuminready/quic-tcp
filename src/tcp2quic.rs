@@ -106,29 +106,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for event in events.iter() {
             match event.token() {
                 UDP_TOKEN => {
-                    // Received data from UDP, send it to quic
-                    let _ = udp_quic(
-                        &mut quic_connection,
-                        &udp_socket,
-                        &mut stream_id_tcp_stream_map,
-                    );
-                    // send the quic data to TCP
+                    info!("UDP client reseve data");
+                    let mut buf = [0; 65535];
+                    // Read incoming UDP packets from the socket and feed them to quiche,
+                    // until there are no more packets to read.
+                    'read: loop {
+                        // If the event loop reported no events, it means that the timeout
+                        // has expired, so handle it without attempting to read packets. We
+                        // will then proceed with the send loop.
+                        if events.is_empty() {
+                            debug!("timed out");
+                            quic_connection.on_timeout();
+                            break 'read;
+                        }
+
+                        let (len, from) = match udp_socket.recv_from(&mut buf) {
+                            Ok(v) => v,
+
+                            Err(e) => {
+                                // There are no more UDP packets to read, so end the read
+                                // loop.
+                                if e.kind() == std::io::ErrorKind::WouldBlock {
+                                    debug!("recv() would block");
+                                    break 'read;
+                                }
+
+                                panic!("recv() failed: {e:?}");
+                            }
+                        };
+
+                        debug!("got {len} bytes");
+
+                        let recv_info = quiche::RecvInfo {
+                            to: udp_socket.local_addr().unwrap(),
+                            from,
+                        };
+
+                        // Process potentially coalesced packets.
+                        let read = match quic_connection.recv(&mut buf[..len], recv_info) {
+                            Ok(v) => v,
+
+                            Err(e) => {
+                                error!("recv failed: {e:?}");
+                                continue 'read;
+                            }
+                        };
+
+                        debug!("processed {read} bytes");
+                    }
+
+                    debug!("done reading");
+
+                    if quic_connection.is_closed() {
+                        info!("connection closed, {:?}", quic_connection.stats());
+                        break;
+                    }
+
+                    if quic_connection.is_established() {
+                        info!("quic connection has established");
+                    }
                     // Process all readable streams.
-                    // for stream_id in quic_connection.readable() {
-                    //     eprintln!("🔴stream_id: {} 🔴", stream_id);
-                    //     let tcp_stream = stream_id_tcp_stream_map.get_mut(&stream_id).unwrap();
-                    //     let done = quic_tcp(tcp_stream, &mut quic_connection, &stream_id)?;
-                    // if done {
-                    // TODO?
-                    // close_connection_by_id(
-                    //     stream_id,
-                    //     &mut token_streamId_map,
-                    //     &mut streamId_token_map,
-                    //     &mut token_tcp_stream_map,
-                    //     &mut poll,
-                    // );
-                    // }
-                    // }
+                    for stream_id in quic_connection.readable() {
+                        eprintln!("stream_id: {} ", stream_id);
+                        if let Some(tcp_stream) = stream_id_tcp_stream_map.get_mut(&stream_id) {
+                            let done = quic_tcp(tcp_stream, &mut quic_connection, &stream_id)?;
+                            if done {
+                                info!("fin response received");
+                            }
+                        } else {
+                            eprintln!("stream_id: {} no longer exist?", stream_id);
+                        }
+                    }
                 }
                 TCP_TOKEN => loop {
                     // Received an event for the TCP server socket, which
@@ -210,7 +258,11 @@ fn close_connection_by_token(
     if let Some(stream_id) = token_stream_id_map.remove(&token) {
         debug!("🟢 remove stream_id {}", stream_id);
         if let Some(mut tcp_stream) = stream_id_tcp_stream_map.remove(&stream_id) {
-            tcp_stream.shutdown(std::net::Shutdown::Both).unwrap();
+            tcp_stream
+                .shutdown(std::net::Shutdown::Both)
+                .unwrap_or_else(|err| {
+                    eprintln!("🔴🔴🔴🔴TCP shutdown error: {}", err);
+                });
             poll.registry().deregister(&mut tcp_stream).unwrap();
         }
     }
@@ -222,7 +274,21 @@ fn next(current: &mut mio::Token) -> mio::Token {
 }
 
 fn next_stream_id(current: &mut u64) -> u64 {
+    // Per RFC 9000, stream IDs are 62-bit integers.
+    const MAX_STREAM_ID: u64 = (1 << 62) - 1;
+
+    // WARNING: Resetting the stream ID counter is a violation of the QUIC
+    // protocol and will cause connection errors. It is strongly recommended
+    // to panic instead, as stream ID exhaustion is a sign of a severe issue.
+    if *current > MAX_STREAM_ID - 4 {
+        warn!(
+            "Stream ID space exhausted. Resetting to 0. This will likely cause the QUIC connection to fail."
+        );
+        *current = 0;
+    }
+
     let next = *current;
+    // We are using client-initiated bidirectional streams, which are even numbers (0, 4, 8, ...).
     *current += 4;
     next
 }
