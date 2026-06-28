@@ -94,19 +94,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = quic_udp(&mut quic_connection, &udp_socket);
 
-    // Map of `Token` -> `TcpStream`.
-    let mut stream_id_tcp_stream_map = HashMap::new();
-    let mut token_stream_id_map = HashMap::new();
     let mut current_stream_id: u64 = 0;
 
     // Unique token for each incoming connection.
     let mut unique_token: mio::Token = mio::Token(UDP_TOKEN.0 + 1);
+
+    let mut client = Client {
+        conn: quic_connection,
+        streamId_tcpStream: HashMap::new(),
+        token_streamId: HashMap::new(),
+        quic_partial_responses: HashMap::new(),
+        tcp_partial_responses: HashMap::new(),
+    };
     loop {
-        poll.poll(&mut events, quic_connection.timeout()).unwrap();
+        poll.poll(&mut events, client.conn.timeout()).unwrap();
         for event in events.iter() {
             match event.token() {
                 UDP_TOKEN => {
-                    info!("UDP client reseve data");
+                    info!("UDP client read event");
                     let mut buf = [0; 65535];
                     // Read incoming UDP packets from the socket and feed them to quiche,
                     // until there are no more packets to read.
@@ -116,13 +121,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // will then proceed with the send loop.
                         if events.is_empty() {
                             debug!("timed out");
-                            quic_connection.on_timeout();
+                            client.conn.on_timeout();
                             break 'read;
                         }
 
                         let (len, from) = match udp_socket.recv_from(&mut buf) {
                             Ok(v) => v,
-
                             Err(e) => {
                                 // There are no more UDP packets to read, so end the read
                                 // loop.
@@ -135,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
 
-                        debug!("got {len} bytes");
+                        debug!("UDP got {len} bytes");
 
                         let recv_info = quiche::RecvInfo {
                             to: udp_socket.local_addr().unwrap(),
@@ -143,11 +147,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
 
                         // Process potentially coalesced packets.
-                        let read = match quic_connection.recv(&mut buf[..len], recv_info) {
+                        let read = match client.conn.recv(&mut buf[..len], recv_info) {
                             Ok(v) => v,
-
                             Err(e) => {
-                                error!("recv failed: {e:?}");
+                                error!("🔴🔴🔴recv failed: {e:?}");
                                 continue 'read;
                             }
                         };
@@ -157,24 +160,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     debug!("done reading");
 
-                    if quic_connection.is_closed() {
-                        info!("connection closed, {:?}", quic_connection.stats());
+                    if client.conn.is_closed() {
+                        info!("connection closed, {:?}", client.conn.stats());
                         break;
                     }
 
-                    if quic_connection.is_established() {
+                    if client.conn.is_established() {
                         info!("quic connection has established");
                     }
                     // Process all readable streams.
-                    for stream_id in quic_connection.readable() {
+                    for stream_id in client.conn.readable() {
                         eprintln!("stream_id: {} ", stream_id);
-                        if let Some(tcp_stream) = stream_id_tcp_stream_map.get_mut(&stream_id) {
-                            let done = quic_tcp(tcp_stream, &mut quic_connection, &stream_id)?;
-                            if done {
-                                info!("fin response received");
-                            }
-                        } else {
-                            eprintln!("stream_id: {} no longer exist?", stream_id);
+                        let done = quic_tcp(&mut client, &stream_id)?;
+                        if done {
+                            info!("fin response received");
                         }
                     }
                 }
@@ -202,25 +201,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let token = next(&mut unique_token);
                     poll.registry()
-                        .register(&mut tcp_stream, token, mio::Interest::READABLE)
+                        .register(
+                            &mut tcp_stream,
+                            token,
+                            mio::Interest::READABLE.add(mio::Interest::WRITABLE),
+                        )
                         .unwrap();
 
                     let stream_id = next_stream_id(&mut current_stream_id);
-                    debug!("🟡 new stream id: {} for {} 🟡", stream_id, address);
-                    token_stream_id_map.insert(token.clone(), stream_id.clone());
+                    debug!("🟢 new stream id: {} for {} 🟢", stream_id, address);
+                    client
+                        .token_streamId
+                        .insert(token.clone(), stream_id.clone());
 
-                    stream_id_tcp_stream_map.insert(stream_id, tcp_stream);
+                    client.streamId_tcpStream.insert(stream_id, tcp_stream);
                 },
                 token => {
+                    let stream_id = client.token_streamId.get(&token).copied().unwrap();
+                    if event.is_writable() {
+                        info!("TCP client is writaible");
+                        quic_tcp(&mut client, &stream_id);
+                    }
+                    if event.is_readable() {
+                        info!("TCP client is readable");
+                        tcp_quic(&mut client, &stream_id);
+                    }
                     // received an event for a TCP connection.
-                    let done = if let Some(stream_id) = token_stream_id_map.get(&token) {
-                        let tcp_stream = stream_id_tcp_stream_map.get_mut(stream_id).unwrap();
-                        let is_closed = match tcp_quic(
-                            tcp_stream,
-                            &mut quic_connection,
-                            stream_id,
-                            &udp_socket,
-                        ) {
+                    let done = if let Some(stream_id) = client.token_streamId.get(&token).cloned() {
+                        let is_closed = match tcp_quic(&mut client, &stream_id) {
                             Ok(result) => result,
                             Err(e) => false,
                         };
@@ -232,19 +240,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     if done {
                         debug!("🟢 done, close tcp stream");
-                        close_connection_by_token(
-                            token,
-                            &mut token_stream_id_map,
-                            &mut stream_id_tcp_stream_map,
-                            &mut poll,
-                        );
+                        // close_connection_by_token(
+                        //     token,
+                        //     &mut token_stream_id_map,
+                        //     &mut stream_id_tcp_stream_map,
+                        //     &mut poll,
+                        // );
                     }
                 }
             }
         }
 
         // flush the data to UDP socket
-        quic_udp(&mut quic_connection, &udp_socket);
+        quic_udp(&mut client.conn, &udp_socket);
     }
 }
 
