@@ -85,6 +85,17 @@ cargo run --release --bin quic_to_tcp 127.0.0.1 4433 127.0.0.1 80
 - [`src/bin/tcp_to_quic.rs`](src/bin/tcp_to_quic.rs): Binary for the TCP-to-QUIC proxy server.
 - [`src/bin/quic_to_tcp.rs`](src/bin/quic_to_tcp.rs): Binary for the QUIC-to-TCP proxy server.
 
+## Certificate Generation
+The QUIC server (`quic_to_tcp`) requires a TLS certificate and private key (`cert.crt` and `cert.key`) to be present in its working directory.
+
+For development and testing, you can generate a self-signed certificate using `openssl`:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout cert.key -out cert.crt -days 365 -nodes -subj "/CN=localhost"
+```
+
+*Note: The `-nodes` flag is required to store the private key without a password, allowing the proxy to load it automatically.*
+
 ## Dependencies
 - `quiche`: QUIC implementation.
 - `mio`: Asynchronous I/O.
