@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events = mio::Events::with_capacity(1024);
 
     let (mut udp_socket, tcp_remote_addr) = if args[1] == "p2p" {
-        if args.len() < 8 {
+        if args.len() < 7 {
             print_usage(&args[0]);
             return Ok(());
         }
@@ -28,31 +28,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let name = &args[3];
         let cap = &args[4];
         let loc = &args[5];
-        let tcp_remote_ip_str = &args[6];
-        let tcp_remote_port_str = &args[7];
-        let tcp_remote_addr = validate_ip_and_port(tcp_remote_ip_str, tcp_remote_port_str)?;
+        let tcp_remote_addr_str = &args[6];
+        let tcp_remote_addr: std::net::SocketAddr = tcp_remote_addr_str.parse().map_err(|e| format!("Invalid TCP remote address: {}", e))?;
 
         println!("P2P Mode: registering at Rendezvous Server {} as '{}'", rendezvous_addr, name);
-        println!("TCP Remote Server: {}:{}", tcp_remote_ip_str, tcp_remote_port_str);
+        println!("TCP Remote Server: {}", tcp_remote_addr);
 
         let std_socket = run_server_p2p_handshake(rendezvous_addr, name, cap, loc)?;
         let udp_socket = mio::net::UdpSocket::from_std(std_socket);
         (udp_socket, tcp_remote_addr)
     } else {
-        if args.len() < 5 {
+        if args.len() < 3 {
             print_usage(&args[0]);
             return Ok(());
         }
-        let udp_local_ip_str = &args[1];
-        let udp_local_port_str = &args[2];
-        let tcp_remote_ip_str = &args[3];
-        let tcp_remote_port_str = &args[4];
+        let udp_local_addr_str = &args[1];
+        let tcp_remote_addr_str = &args[2];
 
-        println!("Direct Mode: listening on UDP {}:{}", udp_local_ip_str, udp_local_port_str);
-        println!("TCP Remote Server: {}:{}", tcp_remote_ip_str, tcp_remote_port_str);
+        let udp_local_addr: std::net::SocketAddr = udp_local_addr_str.parse().map_err(|e| format!("Invalid UDP local address: {}", e))?;
+        let tcp_remote_addr: std::net::SocketAddr = tcp_remote_addr_str.parse().map_err(|e| format!("Invalid TCP remote address: {}", e))?;
 
-        let udp_local_addr = validate_ip_and_port(udp_local_ip_str, udp_local_port_str)?;
-        let tcp_remote_addr = validate_ip_and_port(tcp_remote_ip_str, tcp_remote_port_str)?;
+        println!("Direct Mode: listening on UDP {}", udp_local_addr);
+        println!("TCP Remote Server: {}", tcp_remote_addr);
 
         let udp_socket = mio::net::UdpSocket::bind(udp_local_addr).unwrap();
         (udp_socket, tcp_remote_addr)
@@ -338,9 +335,9 @@ fn validate_token<'a>(src: &net::SocketAddr, token: &'a [u8]) -> Option<quiche::
 
 fn print_usage(bin_name: &str) {
     eprintln!("Usage (Direct Mode):");
-    eprintln!("  {} <Local_UDP_IP> <Local_Port> <Remote_TCP_IP> <Remote_Port>", bin_name);
+    eprintln!("  {} <Local_UDP_IP:Port> <Remote_TCP_IP:Port>", bin_name);
     eprintln!("Usage (P2P Mode):");
-    eprintln!("  {} p2p <Rendezvous_Server_IP:Port> <Name> <Capacity> <Location> <Remote_TCP_IP> <Remote_Port>", bin_name);
+    eprintln!("  {} p2p <Rendezvous_Server_IP:Port> <Name> <Capacity> <Location> <Remote_TCP_IP:Port>", bin_name);
 }
 
 fn run_server_p2p_handshake(

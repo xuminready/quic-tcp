@@ -445,14 +445,6 @@ pub fn interrupted(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::Interrupted
 }
 
-pub fn validate_ip_and_port(ip_str: &str, port_str: &str) -> Result<std::net::SocketAddr, String> {
-    let ip: std::net::IpAddr = ip_str.parse().map_err(|_| "Invalid IP address format".to_string())?;
-    let port: u16 = port_str.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
-    if port == 0 {
-        return Err("Port number must be greater than 0".to_string());
-    }
-    Ok(std::net::SocketAddr::new(ip, port))
-}
 
 pub fn hex_dump(buf: &[u8]) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect::<Vec<String>>().join("")

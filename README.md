@@ -65,19 +65,19 @@ cargo build --release
 #### Start TCP to QUIC Server (Client-side Proxy)
 Listens on a local TCP port and forwards traffic over QUIC to the remote proxy.
 ```bash
-RUST_LOG=debug cargo run --release --bin tcp-to-quic <Local_TCP_IP> <Local_Port> <Remote_UDP_IP> <Remote_Port>
+RUST_LOG=debug cargo run --release --bin tcp-to-quic <Local_TCP_IP:Port> <Remote_UDP_IP:Port>
 
 # Example:
-RUST_LOG=debug cargo run --release --bin tcp-to-quic 127.0.0.1 8080 127.0.0.1 4433
+RUST_LOG=debug cargo run --release --bin tcp-to-quic 127.0.0.1:8080 127.0.0.1:4433
 ```
 
 #### Start QUIC to TCP Server (Server-side Proxy)
 Listens on a UDP port for QUIC connections and proxies them to the target TCP server.
 ```bash
-RUST_LOG=debug cargo run --release --bin quic-to-tcp <Local_UDP_IP> <Local_Port> <Remote_TCP_IP> <Remote_Port>
+RUST_LOG=debug cargo run --release --bin quic-to-tcp <Local_UDP_IP:Port> <Remote_TCP_IP:Port>
 
 # Example:
-RUST_LOG=debug cargo run --release --bin quic-to-tcp 127.0.0.1 4433 127.0.0.1 80
+RUST_LOG=debug cargo run --release --bin quic-to-tcp 127.0.0.1:4433 127.0.0.1:80
 ```
 
 ### P2P Mode (UDP Hole Punching)
@@ -96,7 +96,7 @@ RUST_LOG=debug cargo run --release --bin rendezvous-server 5000
 #### 2. Start the Server Proxy (`quic-to-tcp`) in P2P Mode
 This peer will register itself at the rendezvous server and wait for a client connection.
 ```bash
-RUST_LOG=debug cargo run --release --bin quic-to-tcp p2p <Rendezvous_Server_IP:Port> <Name> <Capacity> <Location> <Remote_TCP_IP> <Remote_Port>
+RUST_LOG=debug cargo run --release --bin quic-to-tcp p2p <Rendezvous_Server_IP:Port> <Name> <Capacity> <Location> <Remote_TCP_IP:Port>
 
 # Example (registering as 'my-server' and forwarding to a local web server on port 80):
 RUST_LOG=debug cargo run --release --bin quic-to-tcp p2p 127.0.0.1:5000 my-server 100Mbps US-West 127.0.0.1:80
@@ -105,7 +105,7 @@ RUST_LOG=debug cargo run --release --bin quic-to-tcp p2p 127.0.0.1:5000 my-serve
 #### 3. Start the Client Proxy (`tcp-to-quic`) in P2P Mode
 This peer will query the rendezvous server, list all available servers, prompt you to select one, perform UDP hole punching, and then start the QUIC tunnel.
 ```bash
-RUST_LOG=debug cargo run --release --bin tcp-to-quic p2p <Rendezvous_Server_IP:Port> <Local_TCP_IP> <Local_Port>
+RUST_LOG=debug cargo run --release --bin tcp-to-quic p2p <Rendezvous_Server_IP:Port> <Local_TCP_IP:Port>
 
 # Example (listening on local port 8080):
 RUST_LOG=debug cargo run --release --bin tcp-to-quic p2p 127.0.0.1:5000 127.0.0.1:8080
