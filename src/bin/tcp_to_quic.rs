@@ -365,19 +365,35 @@ fn run_client_p2p_handshake(rendezvous_addr: std::net::SocketAddr) -> Result<(st
     println!("Starting UDP hole punching to {}...", peer_addr);
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     let mut punched = false;
+    let mut peer_addr = peer_addr; // Make mutable to allow port learning
     for _ in 0..20 { // Try for 2 seconds
         socket.send_to(b"PEER_PUNCH", peer_addr)?;
         match socket.recv_from(&mut buf) {
-            Ok((len, src)) if src == peer_addr => {
-                let msg = std::str::from_utf8(&buf[..len]).unwrap_or("");
-                if msg == "PEER_PUNCH" || msg == "PEER_PUNCH_ACK" {
-                    println!("Hole punching successful! Received from peer.");
-                    socket.send_to(b"PEER_PUNCH_ACK", peer_addr)?;
-                    punched = true;
-                    break;
+            Ok((len, src)) => {
+                let msg = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
+                if src.ip() == peer_addr.ip() {
+                    if msg == "PEER_PUNCH" || msg == "PEER_PUNCH_ACK" {
+                        if src != peer_addr {
+                            println!("Peer port changed from {} to {}. Updating peer address.", peer_addr.port(), src.port());
+                            peer_addr = src;
+                        }
+                        println!("Hole punching successful! Received '{}' from peer.", msg);
+                        socket.send_to(b"PEER_PUNCH_ACK", peer_addr)?;
+                        punched = true;
+                        break;
+                    } else {
+                        debug!("Received unexpected message '{}' from peer IP {}", msg, src);
+                    }
+                } else {
+                    debug!("Received packet from unexpected source {} during hole punching: '{}'", src, msg);
                 }
             }
-            _ => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                // Expected timeout
+            }
+            Err(e) => {
+                debug!("Error during hole punching recv: {}", e);
+            }
         }
     }
 
