@@ -309,7 +309,7 @@ fn run_client_p2p_handshake(rendezvous_addr: std::net::SocketAddr) -> Result<(st
     }
 
     if servers.is_empty() {
-        return Err("No registered quic_to_tcp servers available".into());
+        return Err("No registered quic-to-tcp servers available".into());
     }
 
     // 2. Show list and ask user

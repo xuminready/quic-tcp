@@ -8,8 +8,8 @@ This implementation serves as a bridge, forwarding data between QUIC and TCP str
 
 ### 2. Concurrency & Scalability
 The proxy supports multiple concurrent connections using Rust's `mio` library.
-- `tcp_to_quic`: A server that accepts TCP connections and forwards them through a single QUIC connection.
-- `quic_to_tcp`: A server that listens on a QUIC connection and proxies incoming streams to separate TCP connections.
+- `tcp-to-quic`: A server that accepts TCP connections and forwards them through a single QUIC connection.
+- `quic-to-tcp`: A server that listens on a QUIC connection and proxies incoming streams to separate TCP connections.
 
 ### 3. State Management
 Robust handling of QUIC connection states:
@@ -65,19 +65,19 @@ cargo build --release
 #### Start TCP to QUIC Server (Client-side Proxy)
 Listens on a local TCP port and forwards traffic over QUIC to the remote proxy.
 ```bash
-cargo run --release --bin tcp_to_quic <Local_TCP_IP> <Local_Port> <Remote_UDP_IP> <Remote_Port>
+RUST_LOG=debug cargo run --release --bin tcp-to-quic <Local_TCP_IP> <Local_Port> <Remote_UDP_IP> <Remote_Port>
 
 # Example:
-cargo run --release --bin tcp_to_quic 127.0.0.1 8080 127.0.0.1 4433
+RUST_LOG=debug cargo run --release --bin tcp-to-quic 127.0.0.1 8080 127.0.0.1 4433
 ```
 
 #### Start QUIC to TCP Server (Server-side Proxy)
 Listens on a UDP port for QUIC connections and proxies them to the target TCP server.
 ```bash
-cargo run --release --bin quic_to_tcp <Local_UDP_IP> <Local_Port> <Remote_TCP_IP> <Remote_Port>
+RUST_LOG=debug cargo run --release --bin quic-to-tcp <Local_UDP_IP> <Local_Port> <Remote_TCP_IP> <Remote_Port>
 
 # Example:
-cargo run --release --bin quic_to_tcp 127.0.0.1 4433 127.0.0.1 80
+RUST_LOG=debug cargo run --release --bin quic-to-tcp 127.0.0.1 4433 127.0.0.1 80
 ```
 
 ### P2P Mode (UDP Hole Punching)
@@ -87,28 +87,28 @@ The proxy supports a P2P mode that allows establishing QUIC connections between 
 #### 1. Start the Rendezvous Server
 Run this server on a machine with a publicly reachable IP (or locally for testing):
 ```bash
-cargo run --release --bin rendezvous-server [port]
+RUST_LOG=debug cargo run --release --bin rendezvous-server [port]
 
 # Example (defaults to port 5000):
-cargo run --release --bin rendezvous-server 5000
+RUST_LOG=debug cargo run --release --bin rendezvous-server 5000
 ```
 
-#### 2. Start the Server Proxy (`quic_to_tcp`) in P2P Mode
+#### 2. Start the Server Proxy (`quic-to-tcp`) in P2P Mode
 This peer will register itself at the rendezvous server and wait for a client connection.
 ```bash
-cargo run --release --bin quic_to_tcp p2p <Rendezvous_Server_IP:Port> <Name> <Capacity> <Location> <Remote_TCP_IP> <Remote_Port>
+RUST_LOG=debug cargo run --release --bin quic-to-tcp p2p <Rendezvous_Server_IP:Port> <Name> <Capacity> <Location> <Remote_TCP_IP> <Remote_Port>
 
 # Example (registering as 'my-server' and forwarding to a local web server on port 80):
-cargo run --release --bin quic_to_tcp p2p 127.0.0.1:5000 my-server 100Mbps US-West 127.0.0.1:80
+RUST_LOG=debug cargo run --release --bin quic-to-tcp p2p 127.0.0.1:5000 my-server 100Mbps US-West 127.0.0.1:80
 ```
 
-#### 3. Start the Client Proxy (`tcp_to_quic`) in P2P Mode
+#### 3. Start the Client Proxy (`tcp-to-quic`) in P2P Mode
 This peer will query the rendezvous server, list all available servers, prompt you to select one, perform UDP hole punching, and then start the QUIC tunnel.
 ```bash
-cargo run --release --bin tcp_to_quic p2p <Rendezvous_Server_IP:Port> <Local_TCP_IP> <Local_Port>
+RUST_LOG=debug cargo run --release --bin tcp-to-quic p2p <Rendezvous_Server_IP:Port> <Local_TCP_IP> <Local_Port>
 
 # Example (listening on local port 8080):
-cargo run --release --bin tcp_to_quic p2p 127.0.0.1:5000 127.0.0.1:8080
+RUST_LOG=debug cargo run --release --bin tcp-to-quic p2p 127.0.0.1:5000 127.0.0.1:8080
 ```
 *When prompted, select the server number (e.g., `1`) and press Enter. The peers will automatically perform hole punching and establish the secure QUIC tunnel.*
 
@@ -119,7 +119,7 @@ cargo run --release --bin tcp_to_quic p2p 127.0.0.1:5000 127.0.0.1:8080
 - [`src/bin/rendezvous_server.rs`](src/bin/rendezvous_server.rs): Binary for the Rendezvous Server (helps peers perform UDP hole punching).
 
 ## Certificate Generation
-The QUIC server (`quic_to_tcp`) requires a TLS certificate and private key (`cert.crt` and `cert.key`) to be present in its working directory.
+The QUIC server (`quic-to-tcp`) requires a TLS certificate and private key (`cert.crt` and `cert.key`) to be present in its working directory.
 
 For development and testing, you can generate a self-signed certificate using `openssl`:
 
