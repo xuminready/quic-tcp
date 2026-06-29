@@ -1,45 +1,66 @@
 use log::{debug, error, info, warn};
 use ring::rand::{SystemRandom, SecureRandom};
 use quic_tcp::*; // Import our library
+use std::io::Write;
+use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 5 {
-        eprintln!(
-            "Usage: {} <Remote_UDP_(QUIC)Server_IP> <Remote_Port> <Local_TCP_IP> <Local_Port>",
-            args[0]
-        );
+    if args.len() < 2 {
+        print_usage(&args[0]);
         return Ok(());
     }
 
-    let udp_remote_ip_str = &args[1];
-    let udp_remote_port_str = &args[2];
-    let tcp_local_ip_str = &args[3];
-    let tcp_local_port_str = &args[4];
-
-    println!("UDP(QUIC) Remote Server: {udp_remote_ip_str} and Port: {udp_remote_port_str}");
-    println!("TCP Local Server: {tcp_local_ip_str} and Port: {tcp_local_port_str}");
-
-    let udp_remote_addr = validate_ip_and_port(udp_remote_ip_str, udp_remote_port_str)?;
-    let tcp_local_addr = validate_ip_and_port(tcp_local_ip_str, tcp_local_port_str)?;
-
     let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
+
+    let (mut udp_socket, peer_addr, tcp_local_addr) = if args[1] == "p2p" {
+        if args.len() < 5 {
+            print_usage(&args[0]);
+            return Ok(());
+        }
+        let rendezvous_addr: std::net::SocketAddr = args[2].parse().map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
+        let tcp_local_ip_str = &args[3];
+        let tcp_local_port_str = &args[4];
+        let tcp_local_addr = validate_ip_and_port(tcp_local_ip_str, tcp_local_port_str)?;
+
+        println!("P2P Mode: connecting to Rendezvous Server {}", rendezvous_addr);
+        println!("TCP Local Server: {}:{}", tcp_local_ip_str, tcp_local_port_str);
+
+        let (std_socket, peer_addr) = run_client_p2p_handshake(rendezvous_addr)?;
+        let udp_socket = mio::net::UdpSocket::from_std(std_socket);
+        (udp_socket, peer_addr, tcp_local_addr)
+    } else {
+        if args.len() < 5 {
+            print_usage(&args[0]);
+            return Ok(());
+        }
+        let udp_remote_ip_str = &args[1];
+        let udp_remote_port_str = &args[2];
+        let tcp_local_ip_str = &args[3];
+        let tcp_local_port_str = &args[4];
+
+        println!("Direct Mode: connecting to Remote QUIC Server {}:{}", udp_remote_ip_str, udp_remote_port_str);
+        println!("TCP Local Server: {}:{}", tcp_local_ip_str, tcp_local_port_str);
+
+        let udp_remote_addr = validate_ip_and_port(udp_remote_ip_str, udp_remote_port_str)?;
+        let tcp_local_addr = validate_ip_and_port(tcp_local_ip_str, tcp_local_port_str)?;
+
+        let bind_addr = match udp_remote_addr {
+            std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+            std::net::SocketAddr::V6(_) => "[::]:0",
+        };
+        let udp_socket = mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
+        (udp_socket, udp_remote_addr, tcp_local_addr)
+    };
 
     let mut tcp_server = mio::net::TcpListener::bind(tcp_local_addr).unwrap();
     poll.registry()
         .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)
         .unwrap();
 
-    let peer_addr = udp_remote_addr;
-    let bind_addr = match peer_addr {
-        std::net::SocketAddr::V4(_) => "0.0.0.0:0",
-        std::net::SocketAddr::V6(_) => "[::]:0",
-    };
-    
-    let mut udp_socket = mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
     poll.registry()
         .register(&mut udp_socket, UDP_TOKEN, mio::Interest::READABLE)
         .unwrap();
@@ -52,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let local_addr = udp_socket.local_addr().unwrap();
     let quic_connection = quiche::connect(
-        Some(udp_remote_addr.to_string().as_str()),
+        Some(peer_addr.to_string().as_str()),
         &scid,
         local_addr,
         peer_addr,
@@ -237,4 +258,137 @@ fn next_stream_id(current: &mut u64) -> u64 {
     let next = *current;
     *current += 4;
     next
+}
+
+fn print_usage(bin_name: &str) {
+    eprintln!("Usage (Direct Mode):");
+    eprintln!("  {} <Remote_UDP_IP> <Remote_Port> <Local_TCP_IP> <Local_Port>", bin_name);
+    eprintln!("Usage (P2P Mode):");
+    eprintln!("  {} p2p <Rendezvous_Server_IP:Port> <Local_TCP_IP> <Local_Port>", bin_name);
+}
+
+fn run_client_p2p_handshake(rendezvous_addr: std::net::SocketAddr) -> Result<(std::net::UdpSocket, std::net::SocketAddr), Box<dyn std::error::Error>> {
+    let bind_addr = match rendezvous_addr {
+        std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+        std::net::SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = std::net::UdpSocket::bind(bind_addr)?;
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+
+    let mut buf = [0; 1024];
+
+    // 1. Query servers
+    println!("Querying Rendezvous Server at {}...", rendezvous_addr);
+    let mut list_received = false;
+    let mut servers = Vec::new();
+    for _ in 0..3 { // Retry 3 times
+        socket.send_to(b"QRY", rendezvous_addr)?;
+        match socket.recv_from(&mut buf) {
+            Ok((len, src)) if src == rendezvous_addr => {
+                let reply = std::str::from_utf8(&buf[..len]).unwrap_or("");
+                if reply.starts_with("LIST ") {
+                    let list_str = &reply[5..];
+                    if !list_str.is_empty() {
+                        for s in list_str.split(',') {
+                            let parts: Vec<&str> = s.split(':').collect();
+                            if parts.len() == 3 {
+                                servers.push((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()));
+                            }
+                        }
+                    }
+                    list_received = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !list_received {
+        return Err("Failed to get server list from Rendezvous Server".into());
+    }
+
+    if servers.is_empty() {
+        return Err("No registered quic_to_tcp servers available".into());
+    }
+
+    // 2. Show list and ask user
+    println!("\nAvailable Servers:");
+    for (i, (name, cap, loc)) in servers.iter().enumerate() {
+        println!("{}: {} (Capacity: {}, Location: {})", i + 1, name, cap, loc);
+    }
+    
+    let mut selection = String::new();
+    let selected_idx = loop {
+        print!("\nSelect a server (1-{}): ", servers.len());
+        std::io::stdout().flush()?;
+        selection.clear();
+        std::io::stdin().read_line(&mut selection)?;
+        if let Ok(idx) = selection.trim().parse::<usize>() {
+            if idx > 0 && idx <= servers.len() {
+                break idx - 1;
+            }
+        }
+        println!("Invalid selection, try again.");
+    };
+
+    let target_name = &servers[selected_idx].0;
+
+    // 3. Send CONN and wait for PUNCH
+    println!("Requesting connection to {}...", target_name);
+    socket.set_read_timeout(Some(Duration::from_secs(5)))?; // longer timeout for punch
+    let mut peer_addr = None;
+    for _ in 0..3 {
+        let conn_msg = format!("CONN {}", target_name);
+        socket.send_to(conn_msg.as_bytes(), rendezvous_addr)?;
+        match socket.recv_from(&mut buf) {
+            Ok((len, src)) if src == rendezvous_addr => {
+                let reply = std::str::from_utf8(&buf[..len]).unwrap_or("");
+                if reply.starts_with("PUNCH ") {
+                    let parts: Vec<&str> = reply.split_whitespace().collect();
+                    if parts.len() >= 3 && parts[2] == "active" {
+                        let addr: std::net::SocketAddr = parts[1].parse()?;
+                        peer_addr = Some(addr);
+                        break;
+                    }
+                } else if reply.starts_with("ERR") {
+                    return Err(format!("Server error: {}", reply).into());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let peer_addr = match peer_addr {
+        Some(addr) => addr,
+        None => return Err("Failed to get peer address from P2P server".into()),
+    };
+
+    // 4. Hole Punching Phase
+    println!("Starting UDP hole punching to {}...", peer_addr);
+    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    let mut punched = false;
+    for _ in 0..20 { // Try for 2 seconds
+        socket.send_to(b"PEER_PUNCH", peer_addr)?;
+        match socket.recv_from(&mut buf) {
+            Ok((len, src)) if src == peer_addr => {
+                let msg = std::str::from_utf8(&buf[..len]).unwrap_or("");
+                if msg == "PEER_PUNCH" || msg == "PEER_PUNCH_ACK" {
+                    println!("Hole punching successful! Received from peer.");
+                    socket.send_to(b"PEER_PUNCH_ACK", peer_addr)?;
+                    punched = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !punched {
+        println!("Hole punching completed without explicit peer ack, attempting QUIC anyway...");
+    }
+
+    // Reset timeout
+    socket.set_read_timeout(None)?;
+    Ok((socket, peer_addr))
 }

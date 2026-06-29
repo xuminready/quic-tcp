@@ -80,10 +80,43 @@ cargo run --release --bin quic_to_tcp <Local_UDP_IP> <Local_Port> <Remote_TCP_IP
 cargo run --release --bin quic_to_tcp 127.0.0.1 4433 127.0.0.1 80
 ```
 
+### P2P Mode (UDP Hole Punching)
+
+The proxy supports a P2P mode that allows establishing QUIC connections between two peers even if both are behind NATs (firewalls), without requiring port forwarding. This is achieved using a rendezvous server to coordinate **UDP Hole Punching**.
+
+#### 1. Start the Rendezvous Server
+Run this server on a machine with a publicly reachable IP (or locally for testing):
+```bash
+cargo run --release --bin rendezvous-server [port]
+
+# Example (defaults to port 5000):
+cargo run --release --bin rendezvous-server 5000
+```
+
+#### 2. Start the Server Proxy (`quic_to_tcp`) in P2P Mode
+This peer will register itself at the rendezvous server and wait for a client connection.
+```bash
+cargo run --release --bin quic_to_tcp p2p <Rendezvous_Server_IP:Port> <Name> <Capacity> <Location> <Remote_TCP_IP> <Remote_Port>
+
+# Example (registering as 'my-server' and forwarding to a local web server on port 80):
+cargo run --release --bin quic_to_tcp p2p 127.0.0.1:5000 my-server 100Mbps US-West 127.0.0.1:80
+```
+
+#### 3. Start the Client Proxy (`tcp_to_quic`) in P2P Mode
+This peer will query the rendezvous server, list all available servers, prompt you to select one, perform UDP hole punching, and then start the QUIC tunnel.
+```bash
+cargo run --release --bin tcp_to_quic p2p <Rendezvous_Server_IP:Port> <Local_TCP_IP> <Local_Port>
+
+# Example (listening on local port 8080):
+cargo run --release --bin tcp_to_quic p2p 127.0.0.1:5000 127.0.0.1:8080
+```
+*When prompted, select the server number (e.g., `1`) and press Enter. The peers will automatically perform hole punching and establish the secure QUIC tunnel.*
+
 ## Project Structure
 - [`src/lib.rs`](src/lib.rs): Core library containing the `Session` struct (managing QUIC/TCP streams, buffering, and flushing) and shared utility functions (IP validation, token generation, etc.).
-- [`src/bin/tcp_to_quic.rs`](src/bin/tcp_to_quic.rs): Binary for the TCP-to-QUIC proxy server.
-- [`src/bin/quic_to_tcp.rs`](src/bin/quic_to_tcp.rs): Binary for the QUIC-to-TCP proxy server.
+- [`src/bin/tcp_to_quic.rs`](src/bin/tcp_to_quic.rs): Binary for the TCP-to-QUIC proxy server (supports Direct and P2P modes).
+- [`src/bin/quic_to_tcp.rs`](src/bin/quic_to_tcp.rs): Binary for the QUIC-to-TCP proxy server (supports Direct and P2P modes).
+- [`src/bin/rendezvous_server.rs`](src/bin/rendezvous_server.rs): Binary for the Rendezvous Server (helps peers perform UDP hole punching).
 
 ## Certificate Generation
 The QUIC server (`quic_to_tcp`) requires a TLS certificate and private key (`cert.crt` and `cert.key`) to be present in its working directory.

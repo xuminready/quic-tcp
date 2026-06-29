@@ -20,3 +20,7 @@ path = "src/bin/tcp_to_quic.rs"
 [[bin]]
 name = "quic-to-tcp"
 path = "src/bin/quic_to_tcp.rs"
+
+[[bin]]
+name = "rendezvous-server"
+path = "src/bin/rendezvous_server.rs"
