@@ -34,6 +34,10 @@ pub struct Session {
     pub tcp_partial_writes: HashMap<u64, PartialWrite>,
     /// Streams that have been opened (either by us sending or peer sending).
     pub opened_streams: HashSet<u64>,
+    /// Streams that have finished reading from QUIC and writing to TCP.
+    pub quic_read_done: HashSet<u64>,
+    /// Streams that have finished reading from TCP and writing to QUIC.
+    pub tcp_read_done: HashSet<u64>,
 }
 
 impl Session {
@@ -45,6 +49,8 @@ impl Session {
             quic_partial_writes: HashMap::new(),
             tcp_partial_writes: HashMap::new(),
             opened_streams: HashSet::new(),
+            quic_read_done: HashSet::new(),
+            tcp_read_done: HashSet::new(),
         }
     }
 
@@ -131,8 +137,8 @@ impl Session {
         match self.flush_pending_quic_write(stream_id) {
             FlushStatus::Pending => return Ok(false),
             FlushStatus::FlushedAndClosed => {
-                self.close_tcp_stream_by_id(stream_id, poll);
-                return Ok(true);
+                self.tcp_read_done.insert(stream_id);
+                return Ok(self.maybe_close_stream(stream_id, poll));
             }
             FlushStatus::NoPending | FlushStatus::Flushed => {}
         }
@@ -219,8 +225,8 @@ impl Session {
                 Ok(_) => {
                     debug!("Sent FIN to QUIC stream {}", stream_id);
                     self.opened_streams.insert(stream_id);
-                    self.close_tcp_stream_by_id(stream_id, poll);
-                    return Ok(true);
+                    self.tcp_read_done.insert(stream_id);
+                    return Ok(self.maybe_close_stream(stream_id, poll));
                 }
                 Err(quiche::Error::Done) => {
                     debug!("Buffered FIN for QUIC stream {}", stream_id);
@@ -236,8 +242,8 @@ impl Session {
                 }
                 Err(e) => {
                     error!("Failed to send FIN to QUIC stream {}: {:?}", stream_id, e);
-                    self.close_tcp_stream_by_id(stream_id, poll);
-                    return Ok(true);
+                    self.tcp_read_done.insert(stream_id);
+                    return Ok(self.maybe_close_stream(stream_id, poll));
                 }
             }
         }
@@ -258,8 +264,11 @@ impl Session {
         match self.flush_pending_tcp_write(stream_id)? {
             FlushStatus::Pending => return Ok(false),
             FlushStatus::FlushedAndClosed => {
-                self.close_tcp_stream_by_id(stream_id, poll);
-                return Ok(true);
+                if let Some(tcp_stream) = self.tcp_streams.get_mut(&stream_id) {
+                    tcp_stream.shutdown(std::net::Shutdown::Write).ok();
+                }
+                self.quic_read_done.insert(stream_id);
+                return Ok(self.maybe_close_stream(stream_id, poll));
             }
             FlushStatus::NoPending | FlushStatus::Flushed => {}
         }
@@ -339,8 +348,11 @@ impl Session {
 
         if is_fin {
             debug!("QUIC stream {} received FIN, shutting down TCP stream", stream_id);
-            self.close_tcp_stream_by_id(stream_id, poll);
-            return Ok(true);
+            if let Some(tcp_stream) = self.tcp_streams.get_mut(&stream_id) {
+                tcp_stream.shutdown(std::net::Shutdown::Write).ok();
+            }
+            self.quic_read_done.insert(stream_id);
+            return Ok(self.maybe_close_stream(stream_id, poll));
         }
 
         Ok(false)
@@ -359,6 +371,15 @@ impl Session {
         self.token_to_stream_id.retain(|_, &mut v| v != stream_id);
     }
 
+    fn maybe_close_stream(&mut self, stream_id: u64, poll: &mut mio::Poll) -> bool {
+        if self.quic_read_done.contains(&stream_id) && self.tcp_read_done.contains(&stream_id) {
+            self.close_tcp_stream_internal(stream_id, poll);
+            true
+        } else {
+            false
+        }
+    }
+
     fn close_tcp_stream_internal(&mut self, stream_id: u64, poll: &mut mio::Poll) {
         debug!("Closing TCP stream for QUIC stream {}", stream_id);
         if let Some(mut tcp_stream) = self.tcp_streams.remove(&stream_id) {
@@ -368,6 +389,8 @@ impl Session {
         self.quic_partial_writes.remove(&stream_id);
         self.tcp_partial_writes.remove(&stream_id);
         self.opened_streams.remove(&stream_id);
+        self.quic_read_done.remove(&stream_id);
+        self.tcp_read_done.remove(&stream_id);
     }
 }
 
