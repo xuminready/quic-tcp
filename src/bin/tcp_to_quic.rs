@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("TCP Local Server: {}", tcp_local_addr);
 
         let (std_socket, peer_addr) = run_client_p2p_handshake(rendezvous_addr)?;
+        std_socket.set_nonblocking(true)?;
         let udp_socket = mio::net::UdpSocket::from_std(std_socket);
         (udp_socket, peer_addr, tcp_local_addr)
     } else {
@@ -54,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut tcp_server = mio::net::TcpListener::bind(tcp_local_addr).unwrap();
+    info!("TCP listener bound to {}, waiting for local connections.", tcp_local_addr);
     poll.registry()
         .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)
         .unwrap();
@@ -78,6 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .unwrap();
 
+    info!("Initiating QUIC handshake with peer {}...", peer_addr);
     info!(
         "connecting to {:} from {:} with scid {}",
         peer_addr,
@@ -100,11 +103,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     debug!("UDP client read event");
                     let mut buf = [0; 65535];
                     'read: loop {
-                        if events.is_empty() {
-                            debug!("timed out");
-                            session.conn.on_timeout();
-                            break 'read;
-                        }
 
                         let (len, from) = match udp_socket.recv_from(&mut buf) {
                             Ok(v) => v,
@@ -126,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let read = match session.conn.recv(&mut buf[..len], recv_info) {
                             Ok(v) => v,
                             Err(e) => {
-                                error!("recv failed: {e:?}");
+                                error!("recv failed: {:?}", e);
                                 continue 'read;
                             }
                         };
@@ -242,6 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        session.conn.on_timeout();
         let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
     }
 }
@@ -366,23 +365,44 @@ fn run_client_p2p_handshake(rendezvous_addr: std::net::SocketAddr) -> Result<(st
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     let mut punched = false;
     let mut peer_addr = peer_addr; // Make mutable to allow port learning
-    for _ in 0..20 { // Try for 2 seconds
-        socket.send_to(b"PEER_PUNCH", peer_addr)?;
+    
+    let mut state_msg = b"PEER_PUNCH".as_slice();
+    let mut ack_ack_sends = 0;
+
+    for _ in 0..30 { // Try for 3 seconds
+        socket.send_to(state_msg, peer_addr)?;
+
+        if punched {
+            ack_ack_sends += 1;
+            if ack_ack_sends >= 3 {
+                break;
+            }
+        }
+
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
                 let msg = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                 if src.ip() == peer_addr.ip() {
-                    if msg == "PEER_PUNCH" || msg == "PEER_PUNCH_ACK" {
-                        if src != peer_addr {
-                            println!("Peer port changed from {} to {}. Updating peer address.", peer_addr.port(), src.port());
-                            peer_addr = src;
+                    if msg == "PEER_PUNCH" {
+                        if state_msg == b"PEER_PUNCH" {
+                            info!("Received PUNCH from peer. Sending ACK.");
+                            state_msg = b"PEER_PUNCH_ACK";
                         }
-                        println!("Hole punching successful! Received '{}' from peer.", msg);
-                        socket.send_to(b"PEER_PUNCH_ACK", peer_addr)?;
+                    } else if msg == "PEER_PUNCH_ACK" {
+                        info!("Received ACK from peer. Stream is bi-directional. Sending ACK_ACK.");
+                        state_msg = b"PEER_PUNCH_ACK_ACK";
                         punched = true;
+                    } else if msg == "PEER_PUNCH_ACK_ACK" {
+                        info!("Received ACK_ACK from peer. Peer is ready.");
+                        punched = true;
+                        // Send one final ACK_ACK to ensure the peer exits as well
+                        socket.send_to(b"PEER_PUNCH_ACK_ACK", peer_addr)?;
                         break;
-                    } else {
-                        debug!("Received unexpected message '{}' from peer IP {}", msg, src);
+                    }
+
+                    if src != peer_addr {
+                        info!("Peer port changed from {} to {}. Updating peer address.", peer_addr.port(), src.port());
+                        peer_addr = src;
                     }
                 } else {
                     debug!("Received packet from unexpected source {} during hole punching: '{}'", src, msg);
@@ -398,7 +418,7 @@ fn run_client_p2p_handshake(rendezvous_addr: std::net::SocketAddr) -> Result<(st
     }
 
     if !punched {
-        println!("Hole punching completed without explicit peer ack, attempting QUIC anyway...");
+        info!("Hole punching completed without explicit peer ack, attempting QUIC anyway...");
     }
 
     // Reset timeout

@@ -410,13 +410,20 @@ pub fn flush_quic_to_udp(conn: &mut quiche::Connection, udp_socket: &UdpSocket) 
             }
         };
 
-        if let Err(e) = udp_socket.send_to(&out[..write], send_info.to) {
-            if would_block(&e) {
-                debug!("UDP send would block");
-                break;
+        match udp_socket.send_to(&out[..write], send_info.to) {
+            Ok(bytes_sent) => {
+                if !conn.is_established() {
+                    debug!("-> Sent {} bytes of QUIC handshake data to {}", bytes_sent, send_info.to);
+                }
             }
-            error!("UDP send failed: {:?}", e);
-            return Err(e);
+            Err(e) => {
+                if would_block(&e) {
+                    debug!("UDP send would block");
+                    break;
+                }
+                error!("UDP send failed: {:?}", e);
+                return Err(e);
+            }
         }
     }
     Ok(conn.is_closed())

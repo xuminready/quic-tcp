@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("TCP Remote Server: {}", tcp_remote_addr);
 
         let std_socket = run_server_p2p_handshake(rendezvous_addr, name, cap, loc)?;
+        std_socket.set_nonblocking(true)?;
         let udp_socket = mio::net::UdpSocket::from_std(std_socket);
         (udp_socket, tcp_remote_addr)
     } else {
@@ -68,6 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
 
     let mut sessions = ClientMap::new();
+    let mut established_conns = std::collections::HashSet::new();
     let local_addr = udp_socket.local_addr().unwrap();
     let mut token_scid_map: HashMap<mio::Token, quiche::ConnectionId> = HashMap::new();
     let mut buf = [0; 65535];
@@ -82,11 +84,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 UDP_TOKEN => {
                     debug!("UDP server readable event");
                     'read: loop {
-                        if events.is_empty() {
-                            debug!("timed out");
-                            sessions.values_mut().for_each(|s| s.conn.on_timeout());
-                            break 'read;
-                        }
 
                         let (len, from) = match udp_socket.recv_from(&mut buf) {
                             Ok(v) => v,
@@ -105,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let hdr = match quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
                             Ok(v) => v,
                             Err(e) => {
-                                error!("Parsing packet header failed: {:?}", e);
+                                debug!("Parsing packet header failed: {:?} (len: {}, from: {}, data: {:?})", e, len, from, &pkt_buf[..std::cmp::min(len, 32)]);
                                 continue 'read;
                             }
                         };
@@ -125,6 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 warn!("Doing version negotiation");
                                 let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out).unwrap();
                                 let out = &out[..len];
+                                debug!("-> Sent Version Negotiation ({} bytes) to {}", out.len(), from);
                                 if let Err(e) = udp_socket.send_to(out, from) {
                                     if e.kind() == std::io::ErrorKind::WouldBlock {
                                         break;
@@ -144,6 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let new_token = mint_token(&hdr, &from);
                                 let len = quiche::retry(&hdr.scid, &hdr.dcid, &scid, &new_token, hdr.version, &mut out).unwrap();
                                 let out = &out[..len];
+                                debug!("-> Sent Stateless Retry ({} bytes) to {}", out.len(), from);
                                 if let Err(e) = udp_socket.send_to(out, from) {
                                     if e.kind() == std::io::ErrorKind::WouldBlock {
                                         break;
@@ -165,6 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             let scid = hdr.dcid.clone();
+                            info!("Received QUIC Initial packet from client {}. Initializing session...", from);
                             info!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
                             let conn = quiche::accept(&scid, odcid.as_ref(), local_addr, from, &mut config).unwrap();
@@ -191,6 +191,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
                         debug!("{} processed {} bytes", session.conn.trace_id(), read);
+
+                        if session.conn.is_established() && !established_conns.contains(&hdr.dcid) {
+                            info!("QUIC connection established with client {}!", from);
+                            established_conns.insert(quiche::ConnectionId::from_vec(hdr.dcid.as_ref().to_vec()));
+                        }
 
                         if session.conn.is_in_early_data() || session.conn.is_established() {
                             // Handle writable streams.
@@ -273,6 +278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         for session in sessions.values_mut() {
+            session.conn.on_timeout();
             let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
         }
 
@@ -284,6 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
 
         for scid in closed_connections {
+            established_conns.remove(&scid);
             if let Some(mut session) = sessions.remove(&scid) {
                 info!(
                     "{} connection collected {:?}",
@@ -407,27 +414,48 @@ fn run_server_p2p_handshake(
     };
 
     // 3. Hole Punching Phase
-    println!("Received connection request from {}. Starting hole punching...", peer_addr);
+    info!("Received connection request from {}. Starting hole punching...", peer_addr);
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     let mut punched = false;
     let mut peer_addr = peer_addr; // Make mutable to allow port learning
-    for _ in 0..20 { // Try for 2 seconds
-        socket.send_to(b"PEER_PUNCH", peer_addr)?;
+    
+    let mut state_msg = b"PEER_PUNCH".as_slice();
+    let mut ack_ack_sends = 0;
+
+    for _ in 0..30 { // Try for 3 seconds
+        socket.send_to(state_msg, peer_addr)?;
+
+        if punched {
+            ack_ack_sends += 1;
+            if ack_ack_sends >= 3 {
+                break;
+            }
+        }
+
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
                 let msg = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                 if src.ip() == peer_addr.ip() {
-                    if msg == "PEER_PUNCH" || msg == "PEER_PUNCH_ACK" {
-                        if src != peer_addr {
-                            println!("Peer port changed from {} to {}. Updating peer address.", peer_addr.port(), src.port());
-                            peer_addr = src;
+                    if msg == "PEER_PUNCH" {
+                        if state_msg == b"PEER_PUNCH" {
+                            info!("Received PUNCH from peer. Sending ACK.");
+                            state_msg = b"PEER_PUNCH_ACK";
                         }
-                        println!("Hole punching successful! Received '{}' from peer.", msg);
-                        socket.send_to(b"PEER_PUNCH_ACK", peer_addr)?;
+                    } else if msg == "PEER_PUNCH_ACK" {
+                        info!("Received ACK from peer. Stream is bi-directional. Sending ACK_ACK.");
+                        state_msg = b"PEER_PUNCH_ACK_ACK";
                         punched = true;
+                    } else if msg == "PEER_PUNCH_ACK_ACK" {
+                        info!("Received ACK_ACK from peer. Peer is ready.");
+                        punched = true;
+                        // Send one final ACK_ACK to ensure the peer exits as well
+                        socket.send_to(b"PEER_PUNCH_ACK_ACK", peer_addr)?;
                         break;
-                    } else {
-                        debug!("Received unexpected message '{}' from peer IP {}", msg, src);
+                    }
+
+                    if src != peer_addr {
+                        info!("Peer port changed from {} to {}. Updating peer address.", peer_addr.port(), src.port());
+                        peer_addr = src;
                     }
                 } else {
                     debug!("Received packet from unexpected source {} during hole punching: '{}'", src, msg);
@@ -443,7 +471,7 @@ fn run_server_p2p_handshake(
     }
 
     if !punched {
-        println!("Hole punching completed without explicit peer ack, transitioning to QUIC...");
+        info!("Hole punching completed without explicit peer ack, transitioning to QUIC...");
     }
 
     // Reset timeout
