@@ -5,10 +5,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let port = if args.len() > 1 { &args[1] } else { "5000" };
     let bind_addr = format!("0.0.0.0:{}", port);
-    
+
     let socket = UdpSocket::bind(&bind_addr)?;
     println!("Rendezvous Server listening on {}", bind_addr);
-    
+
     // Maps server name -> (Public SocketAddr, Capacity, Location)
     let mut servers: HashMap<String, (SocketAddr, String, String)> = HashMap::new();
     let mut buf = [0; 1024];
@@ -29,7 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let cap = parts[2].to_string();
                             let loc = parts[3].to_string();
                             servers.insert(name.clone(), (src, cap.clone(), loc.clone()));
-                            println!("Registered server: '{}' at {} (Cap: {}, Loc: {})", name, src, cap, loc);
+                            println!(
+                                "Registered server: '{}' at {} (Cap: {}, Loc: {})",
+                                name, src, cap, loc
+                            );
                             socket.send_to(b"REG_OK", src).ok();
                         } else {
                             socket.send_to(b"ERR Invalid REG format. Expected: REG <name> <capacity> <location>", src).ok();
@@ -47,8 +50,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if parts.len() >= 2 {
                             let target_name = parts[1];
                             if let Some(&(target_addr, _, _)) = servers.get(target_name) {
-                                println!("Connecting client {} to server '{}' ({})", src, target_name, target_addr);
-                                
+                                println!(
+                                    "Connecting client {} to server '{}' ({})",
+                                    src, target_name, target_addr
+                                );
+
                                 // Tell the target server (A) to punch to the client (B)
                                 let msg_to_a = format!("PUNCH {} passive", src);
                                 socket.send_to(msg_to_a.as_bytes(), target_addr).ok();
@@ -57,11 +63,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let msg_to_b = format!("PUNCH {} active", target_addr);
                                 socket.send_to(msg_to_b.as_bytes(), src).ok();
                             } else {
-                                println!("Connection request from {} failed: server '{}' not found", src, target_name);
+                                println!(
+                                    "Connection request from {} failed: server '{}' not found",
+                                    src, target_name
+                                );
                                 socket.send_to(b"ERR Server not found", src).ok();
                             }
                         } else {
-                            socket.send_to(b"ERR Invalid CONN format. Expected: CONN <server_name>", src).ok();
+                            socket
+                                .send_to(
+                                    b"ERR Invalid CONN format. Expected: CONN <server_name>",
+                                    src,
+                                )
+                                .ok();
                         }
                     }
                     _ => {

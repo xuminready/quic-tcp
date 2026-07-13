@@ -1,8 +1,6 @@
-use log::{debug, error, info, warn};
-use ring::rand::{SystemRandom, SecureRandom};
-use quic_tcp::*; // Import our library
-use std::io::Write;
-use std::time::Duration;
+use log::{debug, error, info};
+use quic_tcp::*;
+use ring::rand::{SecureRandom, SystemRandom}; // Import our library
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -21,11 +19,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_usage(&args[0]);
             return Ok(());
         }
-        let rendezvous_addr: std::net::SocketAddr = args[2].parse().map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
+        let rendezvous_addr: std::net::SocketAddr = args[2]
+            .parse()
+            .map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
         let tcp_local_addr_str = &args[3];
-        let tcp_local_addr: std::net::SocketAddr = tcp_local_addr_str.parse().map_err(|e| format!("Invalid TCP local address: {}", e))?;
+        let tcp_local_addr: std::net::SocketAddr = tcp_local_addr_str
+            .parse()
+            .map_err(|e| format!("Invalid TCP local address: {}", e))?;
 
-        println!("P2P Mode: connecting to Rendezvous Server {}", rendezvous_addr);
+        println!(
+            "P2P Mode: connecting to Rendezvous Server {}",
+            rendezvous_addr
+        );
         println!("TCP Local Server: {}", tcp_local_addr);
 
         let (std_socket, peer_addr) = run_client_p2p_handshake(rendezvous_addr)?;
@@ -40,10 +45,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tcp_local_addr_str = &args[1];
         let udp_remote_addr_str = &args[2];
 
-        let tcp_local_addr: std::net::SocketAddr = tcp_local_addr_str.parse().map_err(|e| format!("Invalid TCP local address: {}", e))?;
-        let udp_remote_addr: std::net::SocketAddr = udp_remote_addr_str.parse().map_err(|e| format!("Invalid UDP remote address: {}", e))?;
+        let tcp_local_addr: std::net::SocketAddr = tcp_local_addr_str
+            .parse()
+            .map_err(|e| format!("Invalid TCP local address: {}", e))?;
+        let udp_remote_addr: std::net::SocketAddr = udp_remote_addr_str
+            .parse()
+            .map_err(|e| format!("Invalid UDP remote address: {}", e))?;
 
-        println!("Direct Mode: connecting to Remote QUIC Server {}", udp_remote_addr);
+        println!(
+            "Direct Mode: connecting to Remote QUIC Server {}",
+            udp_remote_addr
+        );
         println!("TCP Local Server: {}", tcp_local_addr);
 
         let bind_addr = match udp_remote_addr {
@@ -55,7 +67,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut tcp_server = mio::net::TcpListener::bind(tcp_local_addr).unwrap();
-    info!("TCP listener bound to {}, waiting for local connections.", tcp_local_addr);
+    info!(
+        "TCP listener bound to {}, waiting for local connections.",
+        tcp_local_addr
+    );
     poll.registry()
         .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)
         .unwrap();
@@ -63,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     poll.registry()
         .register(&mut udp_socket, UDP_TOKEN, mio::Interest::READABLE)
         .unwrap();
-        
+
     let mut config = get_quic_config();
 
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
@@ -103,7 +118,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     debug!("UDP client read event");
                     let mut buf = [0; 65535];
                     'read: loop {
-
                         let (len, from) = match udp_socket.recv_from(&mut buf) {
                             Ok(v) => v,
                             Err(e) => {
@@ -142,12 +156,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info!("QUIC connection established");
                         was_established = true;
                     }
-                    
+
                     // Process all readable streams.
                     for stream_id in session.conn.readable() {
                         session.opened_streams.insert(stream_id);
                         if !session.tcp_streams.contains_key(&stream_id) {
-                            debug!("Readable stream {} not found in tcp_streams (likely closed)", stream_id);
+                            debug!(
+                                "Readable stream {} not found in tcp_streams (likely closed)",
+                                stream_id
+                            );
                             continue;
                         }
                         let done = match session.forward_quic_to_tcp(stream_id, &mut poll) {
@@ -161,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             info!("fin response received");
                         }
                     }
-                    
+
                     // Process all writable streams.
                     for stream_id in session.conn.writable() {
                         if !session.tcp_streams.contains_key(&stream_id) {
@@ -210,25 +227,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if event.is_writable() {
                         debug!("TCP client is writable");
-                        match session.forward_quic_to_tcp(stream_id, &mut poll) {
-                            Ok(true) => tcp_closed = true,
-                            Ok(false) => {},
-                            Err(e) => {
-                                error!("forward_quic_to_tcp failed: {:?}", e);
-                                tcp_closed = true;
-                            }
+                        if session
+                            .forward_quic_to_tcp(stream_id, &mut poll)
+                            .unwrap_or(true)
+                        {
+                            tcp_closed = true;
                         }
                     }
 
                     if event.is_readable() && !tcp_closed {
                         debug!("TCP client is readable");
-                        match session.forward_tcp_to_quic(stream_id, &mut poll) {
-                            Ok(true) => tcp_closed = true,
-                            Ok(false) => {},
-                            Err(e) => {
-                                error!("forward_tcp_to_quic failed: {:?}", e);
-                                tcp_closed = true;
-                            }
+                        if session
+                            .forward_tcp_to_quic(stream_id, &mut poll)
+                            .unwrap_or(true)
+                        {
+                            tcp_closed = true;
                         }
                     }
 
@@ -245,183 +258,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn next_stream_id(current: &mut u64) -> u64 {
-    const MAX_STREAM_ID: u64 = (1 << 62) - 1;
-    if *current > MAX_STREAM_ID - 4 {
-        warn!("Stream ID space exhausted. Resetting to 0.");
-        *current = 0;
-    }
-    let next = *current;
-    *current += 4;
-    next
-}
-
 fn print_usage(bin_name: &str) {
     eprintln!("Usage (Direct Mode):");
     eprintln!("  {} <Local_TCP_IP:Port> <Remote_UDP_IP:Port>", bin_name);
     eprintln!("Usage (P2P Mode):");
-    eprintln!("  {} p2p <Rendezvous_Server_IP:Port> <Local_TCP_IP:Port>", bin_name);
-}
-
-fn run_client_p2p_handshake(rendezvous_addr: std::net::SocketAddr) -> Result<(std::net::UdpSocket, std::net::SocketAddr), Box<dyn std::error::Error>> {
-    let bind_addr = match rendezvous_addr {
-        std::net::SocketAddr::V4(_) => "0.0.0.0:0",
-        std::net::SocketAddr::V6(_) => "[::]:0",
-    };
-    let socket = std::net::UdpSocket::bind(bind_addr)?;
-    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-
-    let mut buf = [0; 1024];
-
-    // 1. Query servers
-    println!("Querying Rendezvous Server at {}...", rendezvous_addr);
-    let mut list_received = false;
-    let mut servers = Vec::new();
-    for _ in 0..3 { // Retry 3 times
-        socket.send_to(b"QRY", rendezvous_addr)?;
-        match socket.recv_from(&mut buf) {
-            Ok((len, src)) if src == rendezvous_addr => {
-                let reply = std::str::from_utf8(&buf[..len]).unwrap_or("");
-                if reply.starts_with("LIST ") {
-                    let list_str = &reply[5..];
-                    if !list_str.is_empty() {
-                        for s in list_str.split(',') {
-                            let parts: Vec<&str> = s.split(':').collect();
-                            if parts.len() == 3 {
-                                servers.push((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()));
-                            }
-                        }
-                    }
-                    list_received = true;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if !list_received {
-        return Err("Failed to get server list from Rendezvous Server".into());
-    }
-
-    if servers.is_empty() {
-        return Err("No registered quic-to-tcp servers available".into());
-    }
-
-    // 2. Show list and ask user
-    println!("\nAvailable Servers:");
-    for (i, (name, cap, loc)) in servers.iter().enumerate() {
-        println!("{}: {} (Capacity: {}, Location: {})", i + 1, name, cap, loc);
-    }
-    
-    let mut selection = String::new();
-    let selected_idx = loop {
-        print!("\nSelect a server (1-{}): ", servers.len());
-        std::io::stdout().flush()?;
-        selection.clear();
-        std::io::stdin().read_line(&mut selection)?;
-        if let Ok(idx) = selection.trim().parse::<usize>() {
-            if idx > 0 && idx <= servers.len() {
-                break idx - 1;
-            }
-        }
-        println!("Invalid selection, try again.");
-    };
-
-    let target_name = &servers[selected_idx].0;
-
-    // 3. Send CONN and wait for PUNCH
-    println!("Requesting connection to {}...", target_name);
-    socket.set_read_timeout(Some(Duration::from_secs(5)))?; // longer timeout for punch
-    let mut peer_addr = None;
-    for _ in 0..3 {
-        let conn_msg = format!("CONN {}", target_name);
-        socket.send_to(conn_msg.as_bytes(), rendezvous_addr)?;
-        match socket.recv_from(&mut buf) {
-            Ok((len, src)) if src == rendezvous_addr => {
-                let reply = std::str::from_utf8(&buf[..len]).unwrap_or("");
-                if reply.starts_with("PUNCH ") {
-                    let parts: Vec<&str> = reply.split_whitespace().collect();
-                    if parts.len() >= 3 && parts[2] == "active" {
-                        let addr: std::net::SocketAddr = parts[1].parse()?;
-                        peer_addr = Some(addr);
-                        break;
-                    }
-                } else if reply.starts_with("ERR") {
-                    return Err(format!("Server error: {}", reply).into());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let peer_addr = match peer_addr {
-        Some(addr) => addr,
-        None => return Err("Failed to get peer address from P2P server".into()),
-    };
-
-    // 4. Hole Punching Phase
-    println!("Starting UDP hole punching to {}...", peer_addr);
-    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-    let mut punched = false;
-    let mut peer_addr = peer_addr; // Make mutable to allow port learning
-    
-    let mut state_msg = b"PEER_PUNCH".as_slice();
-    let mut ack_ack_sends = 0;
-
-    for _ in 0..30 { // Try for 3 seconds
-        socket.send_to(state_msg, peer_addr)?;
-
-        if punched {
-            ack_ack_sends += 1;
-            if ack_ack_sends >= 3 {
-                break;
-            }
-        }
-
-        match socket.recv_from(&mut buf) {
-            Ok((len, src)) => {
-                let msg = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
-                if src.ip() == peer_addr.ip() {
-                    if msg == "PEER_PUNCH" {
-                        if state_msg == b"PEER_PUNCH" {
-                            info!("Received PUNCH from peer. Sending ACK.");
-                            state_msg = b"PEER_PUNCH_ACK";
-                        }
-                    } else if msg == "PEER_PUNCH_ACK" {
-                        info!("Received ACK from peer. Stream is bi-directional. Sending ACK_ACK.");
-                        state_msg = b"PEER_PUNCH_ACK_ACK";
-                        punched = true;
-                    } else if msg == "PEER_PUNCH_ACK_ACK" {
-                        info!("Received ACK_ACK from peer. Peer is ready.");
-                        punched = true;
-                        // Send one final ACK_ACK to ensure the peer exits as well
-                        socket.send_to(b"PEER_PUNCH_ACK_ACK", peer_addr)?;
-                        break;
-                    }
-
-                    if src != peer_addr {
-                        info!("Peer port changed from {} to {}. Updating peer address.", peer_addr.port(), src.port());
-                        peer_addr = src;
-                    }
-                } else {
-                    debug!("Received packet from unexpected source {} during hole punching: '{}'", src, msg);
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                // Expected timeout
-            }
-            Err(e) => {
-                debug!("Error during hole punching recv: {}", e);
-            }
-        }
-    }
-
-    if !punched {
-        info!("Hole punching completed without explicit peer ack, attempting QUIC anyway...");
-    }
-
-    // Reset timeout
-    socket.set_read_timeout(None)?;
-    Ok((socket, peer_addr))
+    eprintln!(
+        "  {} p2p <Rendezvous_Server_IP:Port> <Local_TCP_IP:Port>",
+        bin_name
+    );
 }
