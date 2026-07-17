@@ -82,8 +82,11 @@ impl Session {
                     FlushStatus::Pending
                 }
             }
-            Err(quiche::Error::Done) => {
-                debug!("QUIC stream {} is blocked, cannot flush yet", stream_id);
+            Err(quiche::Error::Done) | Err(quiche::Error::StreamLimit) => {
+                debug!(
+                    "QUIC stream {} is blocked (Done or StreamLimit), cannot flush yet",
+                    stream_id
+                );
                 FlushStatus::Pending
             }
             Err(e) => {
@@ -227,6 +230,21 @@ impl Session {
                                 }
                                 debug!("Sent {} bytes to QUIC stream {}", written, stream_id);
                             }
+                            Err(quiche::Error::StreamLimit) => {
+                                debug!(
+                                    "QUIC stream {} blocked by StreamLimit, buffering all {} bytes",
+                                    stream_id, n
+                                );
+                                self.quic_partial_writes.insert(
+                                    stream_id,
+                                    PartialWrite {
+                                        data: buf[..n].to_vec(),
+                                        written: 0,
+                                        is_fin: false,
+                                    },
+                                );
+                                break 'read;
+                            }
                             Err(e) => {
                                 error!("QUIC stream_send failed: {:?}", e);
                                 return Err(io::Error::other(e));
@@ -258,8 +276,11 @@ impl Session {
                     self.tcp_read_done.insert(stream_id);
                     return Ok(self.maybe_close_stream(stream_id, poll));
                 }
-                Err(quiche::Error::Done) => {
-                    debug!("Buffered FIN for QUIC stream {}", stream_id);
+                Err(quiche::Error::Done) | Err(quiche::Error::StreamLimit) => {
+                    debug!(
+                        "Buffered FIN (Done or StreamLimit) for QUIC stream {}",
+                        stream_id
+                    );
                     self.opened_streams.insert(stream_id);
                     self.quic_partial_writes.insert(
                         stream_id,

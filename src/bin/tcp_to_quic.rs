@@ -189,6 +189,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             session.close_tcp_stream_by_id(stream_id, &mut poll);
                         }
                     }
+
+                    // Retry any pending writes that might be blocked by StreamLimit
+                    let pending_stream_ids: Vec<u64> =
+                        session.quic_partial_writes.keys().copied().collect();
+                    for stream_id in pending_stream_ids {
+                        if session.tcp_streams.contains_key(&stream_id) {
+                            debug!("Retrying pending write for stream {}", stream_id);
+                            if let Err(e) = session.forward_tcp_to_quic(stream_id, &mut poll) {
+                                error!(
+                                    "Failed to resume pending write for stream {}: {:?}",
+                                    stream_id, e
+                                );
+                                session.close_tcp_stream_by_id(stream_id, &mut poll);
+                            }
+                        }
+                    }
                 }
                 TCP_TOKEN => loop {
                     let (mut tcp_stream, address) = match tcp_server.accept() {
