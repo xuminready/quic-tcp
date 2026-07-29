@@ -40,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("TCP Remote Server: {}", tcp_remote_addr);
 
         let std_socket = run_server_p2p_handshake(rendezvous_addr, name, cap, loc)?;
+        info!("UDP punching succeeded");
         std_socket.set_nonblocking(true)?;
         let udp_socket = mio::net::UdpSocket::from_std(std_socket);
         (udp_socket, tcp_remote_addr)

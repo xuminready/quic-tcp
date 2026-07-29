@@ -34,6 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("TCP Local Server: {}", tcp_local_addr);
 
         let (std_socket, peer_addr) = run_client_p2p_handshake(rendezvous_addr)?;
+        info!("UDP punching succeeded");
         std_socket.set_nonblocking(true)?;
         let udp_socket = mio::net::UdpSocket::from_std(std_socket);
         (udp_socket, peer_addr, tcp_local_addr)
