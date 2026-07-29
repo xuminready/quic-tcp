@@ -263,7 +263,9 @@ impl Session {
                 }
                 Err(e) => {
                     error!("TCP read failed: {:?}", e);
-                    return Err(e);
+                    // Force EOF so we send a FIN to QUIC and close the stream
+                    is_eof = true;
+                    break 'read;
                 }
             }
         }
@@ -394,6 +396,7 @@ impl Session {
                             }
                             Err(e) => {
                                 error!("TCP write failed: {:?}", e);
+                                let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
                                 return Err(e);
                             }
                         }
