@@ -2,7 +2,7 @@ use crate::{
     MAX_DATAGRAM_SIZE,
     utils::{interrupted, would_block},
 };
-use log::{debug, error};
+use log::{debug, error, warn};
 use mio::net::UdpSocket;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
@@ -14,6 +14,17 @@ pub enum FlushStatus {
     Flushed,
     FlushedAndClosed,
     Pending,
+}
+
+pub fn is_disconnect_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 pub struct PartialWrite {
@@ -265,7 +276,11 @@ impl Session {
                     continue 'read;
                 }
                 Err(e) => {
-                    error!("TCP read failed: {:?}", e);
+                    if is_disconnect_error(&e) {
+                        debug!("TCP stream {} disconnected by peer: {}", stream_id, e);
+                    } else {
+                        warn!("TCP read failed on stream {}: {:?}", stream_id, e);
+                    }
                     // Force EOF so we send a FIN to QUIC and close the stream
                     is_eof = true;
                     break 'read;
@@ -398,7 +413,11 @@ impl Session {
                                 break 'recv;
                             }
                             Err(e) => {
-                                error!("TCP write failed: {:?}", e);
+                                if is_disconnect_error(&e) {
+                                    debug!("TCP stream {} write disconnected: {}", stream_id, e);
+                                } else {
+                                    warn!("TCP write failed on stream {}: {:?}", stream_id, e);
+                                }
                                 let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
                                 return Err(e);
                             }
@@ -412,8 +431,13 @@ impl Session {
                 Err(quiche::Error::Done) => {
                     break 'recv;
                 }
+                Err(quiche::Error::InvalidStreamState(_)) | Err(quiche::Error::StreamStopped(_)) => {
+                    debug!("QUIC stream {} is reset or stopped", stream_id);
+                    is_fin = true;
+                    break 'recv;
+                }
                 Err(e) => {
-                    error!("QUIC stream_recv failed: {:?}", e);
+                    warn!("QUIC stream_recv failed for stream {}: {:?}", stream_id, e);
                     return Err(io::Error::other(e));
                 }
             }
@@ -461,6 +485,8 @@ impl Session {
         if let Some(mut tcp_stream) = self.tcp_streams.remove(&stream_id) {
             poll.registry().deregister(&mut tcp_stream).ok();
         }
+        let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+        let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
         self.quic_partial_writes.remove(&stream_id);
         self.tcp_partial_writes.remove(&stream_id);
         self.opened_streams.remove(&stream_id);

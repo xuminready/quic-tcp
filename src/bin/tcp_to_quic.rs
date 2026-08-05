@@ -1,4 +1,4 @@
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use quic_tcp::*;
 use ring::rand::{SecureRandom, SystemRandom}; // Import our library
 
@@ -193,7 +193,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let done = match session.forward_quic_to_tcp(stream_id, &mut poll) {
                             Ok(v) => v,
                             Err(e) => {
-                                error!("forward_quic_to_tcp failed: {:?}", e);
+                                if quic_tcp::session::is_disconnect_error(&e) {
+                                    debug!("forward_quic_to_tcp stream {} disconnected: {}", stream_id, e);
+                                } else {
+                                    warn!("forward_quic_to_tcp failed: {:?}", e);
+                                }
+                                session.close_tcp_stream_by_id(stream_id, &mut poll);
                                 true
                             }
                         };
@@ -208,7 +213,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         if let Err(e) = session.forward_tcp_to_quic(stream_id, &mut poll) {
-                            error!("forward_tcp_to_quic failed: {:?}", e);
+                            if quic_tcp::session::is_disconnect_error(&e) {
+                                debug!("forward_tcp_to_quic stream {} disconnected: {}", stream_id, e);
+                            } else {
+                                warn!("forward_tcp_to_quic failed: {:?}", e);
+                            }
                             session.close_tcp_stream_by_id(stream_id, &mut poll);
                         }
                     }
@@ -218,10 +227,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for stream_id in all_stream_ids {
                         if session.tcp_streams.contains_key(&stream_id) {
                             if let Err(e) = session.forward_tcp_to_quic(stream_id, &mut poll) {
-                                error!(
-                                    "Failed to forward TCP to QUIC for stream {}: {:?}",
-                                    stream_id, e
-                                );
+                                if quic_tcp::session::is_disconnect_error(&e) {
+                                    debug!("forward_tcp_to_quic stream {} disconnected: {}", stream_id, e);
+                                } else {
+                                    warn!("Failed to forward TCP to QUIC for stream {}: {:?}", stream_id, e);
+                                }
                                 session.close_tcp_stream_by_id(stream_id, &mut poll);
                             }
                         }
@@ -272,7 +282,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             Err(e) => {
-                                info!("forward_quic_to_tcp returned error for stream {}: {:?}", stream_id, e);
+                                if quic_tcp::session::is_disconnect_error(&e) {
+                                    debug!("forward_quic_to_tcp stream {} disconnected: {}", stream_id, e);
+                                } else {
+                                    warn!("forward_quic_to_tcp returned error for stream {}: {:?}", stream_id, e);
+                                }
                                 tcp_closed = true;
                             }
                         }
@@ -288,7 +302,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             Err(e) => {
-                                info!("forward_tcp_to_quic returned error for stream {}: {:?}", stream_id, e);
+                                if quic_tcp::session::is_disconnect_error(&e) {
+                                    debug!("forward_tcp_to_quic stream {} disconnected: {}", stream_id, e);
+                                } else {
+                                    warn!("forward_tcp_to_quic returned error for stream {}: {:?}", stream_id, e);
+                                }
                                 tcp_closed = true;
                             }
                         }
