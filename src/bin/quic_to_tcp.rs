@@ -112,6 +112,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = session.forward_quic_to_tcp(stream_id, &mut poll);
                 }
             }
+
+            let active_streams: Vec<u64> = session.tcp_streams.keys().copied().collect();
+            for stream_id in active_streams {
+                if session.tcp_streams.contains_key(&stream_id)
+                    && !session.quic_partial_writes.contains_key(&stream_id)
+                    && !session.tcp_read_done.contains(&stream_id)
+                {
+                    if let Err(e) = session.forward_tcp_to_quic(stream_id, &mut poll) {
+                        if quic_tcp::session::is_disconnect_error(&e) {
+                            debug!("forward_tcp_to_quic stream {} disconnected: {}", stream_id, e);
+                        } else {
+                            warn!("Failed to forward TCP to QUIC for stream {}: {:?}", stream_id, e);
+                        }
+                        session.close_tcp_stream_by_id(stream_id, &mut poll);
+                    }
+                }
+            }
         }
 
         for event in events.iter() {

@@ -27,6 +27,8 @@ pub fn is_disconnect_error(e: &io::Error) -> bool {
     )
 }
 
+pub const MAX_TCP_READ_PER_CALL: usize = 65536 * 4; // 256 KB max read per call
+
 pub struct PartialWrite {
     pub data: Vec<u8>,
     pub written: usize,
@@ -182,6 +184,11 @@ impl Session {
             return Ok(false);
         }
 
+        if self.quic_partial_writes.contains_key(&stream_id) {
+            debug!("QUIC write buffer already pending for stream {}, delaying TCP read", stream_id);
+            return Ok(false);
+        }
+
         let Some(tcp_stream) = self.tcp_streams.get_mut(&stream_id) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -191,8 +198,17 @@ impl Session {
 
         let mut buf = [0; MAX_DATAGRAM_SIZE];
         let mut is_eof = false;
+        let mut bytes_read_this_call = 0;
 
         'read: loop {
+            if bytes_read_this_call >= MAX_TCP_READ_PER_CALL {
+                debug!(
+                    "Reached max TCP read limit per call ({}) for stream {}",
+                    MAX_TCP_READ_PER_CALL, stream_id
+                );
+                break 'read;
+            }
+
             let capacity = if self.opened_streams.contains(&stream_id) {
                 match self.conn.stream_capacity(stream_id) {
                     Ok(cap) => cap,
@@ -221,6 +237,7 @@ impl Session {
                 }
                 Ok(n) => {
                     debug!("Read {} bytes from TCP stream {}", n, stream_id);
+                    bytes_read_this_call += n;
                     if self.conn.is_in_early_data() || self.conn.is_established() {
                         match self.conn.stream_send(stream_id, &buf[..n], false) {
                             Ok(written) => {
@@ -258,8 +275,17 @@ impl Session {
                                 );
                                 break 'read;
                             }
+                            Err(quiche::Error::InvalidStreamState(_))
+                            | Err(quiche::Error::StreamStopped(_))
+                            | Err(quiche::Error::StreamReset(_)) => {
+                                debug!(
+                                    "QUIC stream {} reset/stopped by peer, dropping TCP stream and buffered data",
+                                    stream_id
+                                );
+                                self.close_tcp_stream_internal(stream_id, poll);
+                                return Ok(true);
+                            }
                             Err(e) => {
-                                eprintln!("🔴 QUIC stream_send failed for stream {}: {:?}", stream_id, e);
                                 error!("QUIC stream_send failed: {:?}", e);
                                 return Err(io::Error::other(e));
                             }
@@ -281,9 +307,11 @@ impl Session {
                     } else {
                         warn!("TCP read failed on stream {}: {:?}", stream_id, e);
                     }
-                    // Force EOF so we send a FIN to QUIC and close the stream
-                    is_eof = true;
-                    break 'read;
+                    debug!("TCP client disconnected, informing peer via QUIC reset & dropping buffered data");
+                    let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+                    let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+                    self.close_tcp_stream_internal(stream_id, poll);
+                    return Ok(true);
                 }
             }
         }
@@ -419,7 +447,9 @@ impl Session {
                                     warn!("TCP write failed on stream {}: {:?}", stream_id, e);
                                 }
                                 let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
-                                return Err(e);
+                                let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+                                self.close_tcp_stream_internal(stream_id, poll);
+                                return Ok(true);
                             }
                         }
                     }
@@ -431,10 +461,15 @@ impl Session {
                 Err(quiche::Error::Done) => {
                     break 'recv;
                 }
-                Err(quiche::Error::InvalidStreamState(_)) | Err(quiche::Error::StreamStopped(_)) => {
-                    debug!("QUIC stream {} is reset or stopped", stream_id);
-                    is_fin = true;
-                    break 'recv;
+                Err(quiche::Error::InvalidStreamState(_))
+                | Err(quiche::Error::StreamStopped(_))
+                | Err(quiche::Error::StreamReset(_)) => {
+                    debug!(
+                        "QUIC stream {} reset/stopped by peer, dropping TCP stream and buffered data",
+                        stream_id
+                    );
+                    self.close_tcp_stream_internal(stream_id, poll);
+                    return Ok(true);
                 }
                 Err(e) => {
                     warn!("QUIC stream_recv failed for stream {}: {:?}", stream_id, e);
