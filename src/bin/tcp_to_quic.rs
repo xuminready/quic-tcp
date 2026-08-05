@@ -112,7 +112,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut was_established = false;
 
     loop {
-        poll.poll(&mut events, session.conn.timeout()).unwrap();
+        let timeout = session.conn.timeout().or(if !session.tcp_streams.is_empty()
+            || !session.quic_partial_writes.is_empty()
+            || !session.tcp_partial_writes.is_empty()
+        {
+            Some(std::time::Duration::from_millis(50))
+        } else {
+            None
+        });
+        poll.poll(&mut events, timeout).unwrap();
+
+        let pending_ids: Vec<u64> = session.quic_partial_writes.keys().copied().collect();
+        for stream_id in pending_ids {
+            session.flush_pending_quic_write(stream_id);
+        }
+
+        let pending_tcp_ids: Vec<u64> = session.tcp_partial_writes.keys().copied().collect();
+        for stream_id in pending_tcp_ids {
+            let _ = session.flush_pending_tcp_write(stream_id);
+            if !session.tcp_partial_writes.contains_key(&stream_id) {
+                let _ = session.forward_quic_to_tcp(stream_id, &mut poll);
+            }
+        }
+
         for event in events.iter() {
             match event.token() {
                 UDP_TOKEN => {
@@ -191,15 +213,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // Retry any pending writes that might be blocked by StreamLimit
-                    let pending_stream_ids: Vec<u64> =
-                        session.quic_partial_writes.keys().copied().collect();
-                    for stream_id in pending_stream_ids {
+                    // Retry any pending writes or delayed TCP reads once connection is established
+                    let all_stream_ids: Vec<u64> = session.tcp_streams.keys().copied().collect();
+                    for stream_id in all_stream_ids {
                         if session.tcp_streams.contains_key(&stream_id) {
-                            debug!("Retrying pending write for stream {}", stream_id);
                             if let Err(e) = session.forward_tcp_to_quic(stream_id, &mut poll) {
                                 error!(
-                                    "Failed to resume pending write for stream {}: {:?}",
+                                    "Failed to forward TCP to QUIC for stream {}: {:?}",
                                     stream_id, e
                                 );
                                 session.close_tcp_stream_by_id(stream_id, &mut poll);
@@ -244,26 +264,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if event.is_writable() {
                         debug!("TCP client is writable");
-                        if session
-                            .forward_quic_to_tcp(stream_id, &mut poll)
-                            .unwrap_or(true)
-                        {
-                            tcp_closed = true;
+                        match session.forward_quic_to_tcp(stream_id, &mut poll) {
+                            Ok(closed) => {
+                                if closed {
+                                    info!("forward_quic_to_tcp returned closed=true for stream {}", stream_id);
+                                    tcp_closed = true;
+                                }
+                            }
+                            Err(e) => {
+                                info!("forward_quic_to_tcp returned error for stream {}: {:?}", stream_id, e);
+                                tcp_closed = true;
+                            }
                         }
                     }
 
                     if event.is_readable() && !tcp_closed {
                         debug!("TCP client is readable");
-                        if session
-                            .forward_tcp_to_quic(stream_id, &mut poll)
-                            .unwrap_or(true)
-                        {
-                            tcp_closed = true;
+                        match session.forward_tcp_to_quic(stream_id, &mut poll) {
+                            Ok(closed) => {
+                                if closed {
+                                    info!("forward_tcp_to_quic returned closed=true for stream {}", stream_id);
+                                    tcp_closed = true;
+                                }
+                            }
+                            Err(e) => {
+                                info!("forward_tcp_to_quic returned error for stream {}: {:?}", stream_id, e);
+                                tcp_closed = true;
+                            }
                         }
                     }
 
                     if tcp_closed {
-                        debug!("🟢 done, close tcp stream");
+                        info!("🟢 done, close tcp stream {}", stream_id);
                         session.close_tcp_stream_by_token(token, &mut poll);
                     }
                 }

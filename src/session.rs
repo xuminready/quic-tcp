@@ -84,9 +84,10 @@ impl Session {
             }
             Err(quiche::Error::Done) | Err(quiche::Error::StreamLimit) => {
                 debug!(
-                    "QUIC stream {} is blocked (Done or StreamLimit), cannot flush yet",
+                    "QUIC stream {} is blocked (Done or StreamLimit), sending 0-byte probe to elicit window update",
                     stream_id
                 );
+                let _ = self.conn.stream_send(stream_id, &[], false);
                 FlushStatus::Pending
             }
             Err(e) => {
@@ -230,11 +231,12 @@ impl Session {
                                 }
                                 debug!("Sent {} bytes to QUIC stream {}", written, stream_id);
                             }
-                            Err(quiche::Error::StreamLimit) => {
+                            Err(quiche::Error::Done) | Err(quiche::Error::StreamLimit) => {
                                 debug!(
-                                    "QUIC stream {} blocked by StreamLimit, buffering all {} bytes",
+                                    "QUIC stream {} blocked (Done or StreamLimit), buffering all {} bytes & probing",
                                     stream_id, n
                                 );
+                                let _ = self.conn.stream_send(stream_id, &[], false);
                                 self.quic_partial_writes.insert(
                                     stream_id,
                                     PartialWrite {
@@ -246,6 +248,7 @@ impl Session {
                                 break 'read;
                             }
                             Err(e) => {
+                                eprintln!("🔴 QUIC stream_send failed for stream {}: {:?}", stream_id, e);
                                 error!("QUIC stream_send failed: {:?}", e);
                                 return Err(io::Error::other(e));
                             }
@@ -456,7 +459,6 @@ impl Session {
     fn close_tcp_stream_internal(&mut self, stream_id: u64, poll: &mut mio::Poll) {
         debug!("Closing TCP stream for QUIC stream {}", stream_id);
         if let Some(mut tcp_stream) = self.tcp_streams.remove(&stream_id) {
-            tcp_stream.shutdown(std::net::Shutdown::Both).ok();
             poll.registry().deregister(&mut tcp_stream).ok();
         }
         self.quic_partial_writes.remove(&stream_id);

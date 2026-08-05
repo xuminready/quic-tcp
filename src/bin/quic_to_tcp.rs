@@ -86,8 +86,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut unique_token = mio::Token(UDP_TOKEN.0 + 1);
 
     loop {
-        let timeout = sessions.values().filter_map(|s| s.conn.timeout()).min();
+        let min_conn_timeout = sessions.values().filter_map(|s| s.conn.timeout()).min();
+        let has_active_streams = sessions.values().any(|s| {
+            !s.tcp_streams.is_empty()
+                || !s.quic_partial_writes.is_empty()
+                || !s.tcp_partial_writes.is_empty()
+        });
+        let timeout = min_conn_timeout.or(if has_active_streams {
+            Some(std::time::Duration::from_millis(50))
+        } else {
+            None
+        });
         poll.poll(&mut events, timeout).unwrap();
+
+        for session in sessions.values_mut() {
+            let pending_ids: Vec<u64> = session.quic_partial_writes.keys().copied().collect();
+            for stream_id in pending_ids {
+                session.flush_pending_quic_write(stream_id);
+            }
+
+            let pending_tcp_ids: Vec<u64> = session.tcp_partial_writes.keys().copied().collect();
+            for stream_id in pending_tcp_ids {
+                let _ = session.flush_pending_tcp_write(stream_id);
+                if !session.tcp_partial_writes.contains_key(&stream_id) {
+                    let _ = session.forward_quic_to_tcp(stream_id, &mut poll);
+                }
+            }
+        }
 
         for event in events.iter() {
             match event.token() {
@@ -129,6 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let session = if !sessions.contains_key(&hdr.dcid)
                             && !sessions.contains_key(&conn_id)
+                            && sessions.is_empty()
                         {
                             if hdr.ty != quiche::Type::Initial {
                                 error!("Packet is not Initial");
@@ -213,9 +239,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             sessions.insert(scid.clone(), session);
                             sessions.get_mut(&scid).unwrap()
                         } else {
-                            match sessions.get_mut(&hdr.dcid) {
-                                Some(v) => v,
-                                None => sessions.get_mut(&conn_id).unwrap(),
+                            if let Some(v) = sessions.get_mut(&hdr.dcid) {
+                                v
+                            } else if let Some(v) = sessions.get_mut(&conn_id) {
+                                v
+                            } else {
+                                sessions.values_mut().next().unwrap()
                             }
                         };
 
@@ -254,8 +283,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 {
                                     let token = next_token(&mut unique_token);
                                     info!("Create a new TCP connection for stream id {stream_id}");
-                                    let mut tcp_stream =
-                                        mio::net::TcpStream::connect(tcp_remote_addr).unwrap();
+                                     let mut tcp_stream = match mio::net::TcpStream::connect(tcp_remote_addr) {
+                                         Ok(s) => s,
+                                         Err(e) => {
+                                             error!("Failed to connect to remote TCP server {}: {:?}", tcp_remote_addr, e);
+                                             session.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0).ok();
+                                             continue;
+                                         }
+                                     };
                                     poll.registry()
                                         .register(
                                             &mut tcp_stream,
@@ -273,6 +308,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
 
                                 session.forward_quic_to_tcp(stream_id, &mut poll).ok();
+                            }
+
+                            // Retry any pending writes that might be blocked by StreamLimit
+                            let pending_stream_ids: Vec<u64> =
+                                session.quic_partial_writes.keys().copied().collect();
+                            for stream_id in pending_stream_ids {
+                                if session.tcp_streams.contains_key(&stream_id) {
+                                    debug!("Retrying pending write for stream {}", stream_id);
+                                    if let Err(e) = session.forward_tcp_to_quic(stream_id, &mut poll) {
+                                        error!(
+                                            "Failed to resume pending write for stream {}: {:?}",
+                                            stream_id, e
+                                        );
+                                        session.close_tcp_stream_by_id(stream_id, &mut poll);
+                                        token_scid_map.retain(|tok, _| session.token_to_stream_id.contains_key(tok));
+                                    }
+                                }
                             }
                         } else {
                             debug!("Not early data neither established");
