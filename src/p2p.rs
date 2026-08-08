@@ -77,6 +77,9 @@ pub fn perform_hole_punching(
 
     if !punched {
         info!("Hole punching completed without explicit peer ack, transitioning...");
+    } else {
+        info!("UDP hole punching succeeded with peer {}!", peer_addr);
+        println!("UDP hole punching succeeded with peer {}!", peer_addr);
     }
 
     Ok(peer_addr)
@@ -159,7 +162,9 @@ pub fn run_server_p2p_handshake(
         "Received connection request from {}. Starting hole punching...",
         peer_addr
     );
-    let _final_peer_addr = perform_hole_punching(&socket, peer_addr)?;
+    let final_peer_addr = perform_hole_punching(&socket, peer_addr)?;
+    info!("UDP hole punching succeeded on server side with peer {}", final_peer_addr);
+    println!("UDP hole punching succeeded on server side with peer {}", final_peer_addr);
 
     // Reset timeout
     socket.set_read_timeout(None)?;
@@ -275,6 +280,8 @@ pub fn run_client_p2p_handshake(
     // 4. Hole Punching Phase
     println!("Starting UDP hole punching to {}...", peer_addr);
     let final_peer_addr = perform_hole_punching(&socket, peer_addr)?;
+    info!("UDP hole punching succeeded on client side with peer {}", final_peer_addr);
+    println!("UDP hole punching succeeded on client side with peer {}", final_peer_addr);
 
     // Reset timeout
     socket.set_read_timeout(None)?;

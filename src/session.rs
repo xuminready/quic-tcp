@@ -2,7 +2,7 @@ use crate::{
     MAX_DATAGRAM_SIZE,
     utils::{interrupted, would_block},
 };
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use mio::net::UdpSocket;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
@@ -24,6 +24,7 @@ pub fn is_disconnect_error(e: &io::Error) -> bool {
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::NotConnected
             | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotFound
     )
 }
 
@@ -155,6 +156,16 @@ impl Session {
                 self.tcp_partial_writes.remove(&stream_id);
                 Err(e)
             }
+        }
+    }
+
+    /// Sends an ACK-eliciting PING frame to keep the connection and NAT UDP mappings alive.
+    pub fn send_ping(&mut self) -> bool {
+        if self.conn.is_established() || self.conn.is_in_early_data() {
+            info!("Sending periodic QUIC PING to keep NAT mapping alive");
+            self.conn.send_ack_eliciting().is_ok()
+        } else {
+            false
         }
     }
 
@@ -503,7 +514,6 @@ impl Session {
     /// Closes and cleans up a TCP stream by its QUIC stream ID.
     pub fn close_tcp_stream_by_id(&mut self, stream_id: u64, poll: &mut mio::Poll) {
         self.close_tcp_stream_internal(stream_id, poll);
-        self.token_to_stream_id.retain(|_, &mut v| v != stream_id);
     }
 
     fn maybe_close_stream(&mut self, stream_id: u64, poll: &mut mio::Poll) -> bool {
@@ -522,6 +532,7 @@ impl Session {
         }
         let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
         let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+        self.token_to_stream_id.retain(|_, &mut v| v != stream_id);
         self.quic_partial_writes.remove(&stream_id);
         self.tcp_partial_writes.remove(&stream_id);
         self.opened_streams.remove(&stream_id);

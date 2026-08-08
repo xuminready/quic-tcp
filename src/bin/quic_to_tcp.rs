@@ -40,7 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("TCP Remote Server: {}", tcp_remote_addr);
 
         let std_socket = run_server_p2p_handshake(rendezvous_addr, name, cap, loc)?;
-        info!("UDP punching succeeded");
+        info!("UDP hole punching succeeded on server side!");
+        println!("UDP hole punching succeeded on server side!");
         std_socket.set_nonblocking(true)?;
         let udp_socket = mio::net::UdpSocket::from_std(std_socket);
         (udp_socket, tcp_remote_addr)
@@ -85,19 +86,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = [0; 65535];
     let mut unique_token = mio::Token(UDP_TOKEN.0 + 1);
 
+    let mut last_ping = std::time::Instant::now();
+    let ping_interval = std::time::Duration::from_secs(5);
+
     loop {
+        let time_to_next_ping = ping_interval.saturating_sub(last_ping.elapsed());
         let min_conn_timeout = sessions.values().filter_map(|s| s.conn.timeout()).min();
         let has_active_streams = sessions.values().any(|s| {
             !s.tcp_streams.is_empty()
                 || !s.quic_partial_writes.is_empty()
                 || !s.tcp_partial_writes.is_empty()
         });
-        let timeout = min_conn_timeout.or(if has_active_streams {
+        let timeout = if has_active_streams {
             Some(std::time::Duration::from_millis(50))
+        } else if !sessions.is_empty() {
+            min_conn_timeout
+                .map(|t| t.min(time_to_next_ping))
+                .or(Some(time_to_next_ping))
         } else {
             None
-        });
+        };
         poll.poll(&mut events, timeout).unwrap();
+
+        if last_ping.elapsed() >= ping_interval {
+            for session in sessions.values_mut() {
+                if session.send_ping() {
+                    let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+                }
+            }
+            last_ping = std::time::Instant::now();
+        }
 
         for session in sessions.values_mut() {
             let pending_ids: Vec<u64> = session.quic_partial_writes.keys().copied().collect();
@@ -364,8 +382,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     let Some(session) = sessions.get_mut(scid) else {
                         debug!("Session not found for scid {:?}", scid);
+                        token_scid_map.remove(&token);
                         continue;
                     };
+                    let Some(stream_id) = session.token_to_stream_id.get(&token).copied() else {
+                        token_scid_map.remove(&token);
+                        continue;
+                    };
+                    if !session.tcp_streams.contains_key(&stream_id) {
+                        token_scid_map.remove(&token);
+                        continue;
+                    }
 
                     let mut tcp_closed = false;
 

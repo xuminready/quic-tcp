@@ -34,7 +34,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("TCP Local Server: {}", tcp_local_addr);
 
         let (std_socket, peer_addr) = run_client_p2p_handshake(rendezvous_addr)?;
-        info!("UDP punching succeeded");
+        info!("UDP hole punching succeeded on client side with peer {}", peer_addr);
+        println!("UDP hole punching succeeded on client side with peer {}", peer_addr);
         std_socket.set_nonblocking(true)?;
         let udp_socket = mio::net::UdpSocket::from_std(std_socket);
         (udp_socket, peer_addr, tcp_local_addr)
@@ -110,17 +111,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut current_stream_id: u64 = 0;
     let mut unique_token = mio::Token(UDP_TOKEN.0 + 1);
     let mut was_established = false;
+    let mut last_ping = std::time::Instant::now();
+    let ping_interval = std::time::Duration::from_secs(5);
 
     loop {
-        let timeout = session.conn.timeout().or(if !session.tcp_streams.is_empty()
+        let time_to_next_ping = ping_interval.saturating_sub(last_ping.elapsed());
+        let has_active_streams = !session.tcp_streams.is_empty()
             || !session.quic_partial_writes.is_empty()
-            || !session.tcp_partial_writes.is_empty()
-        {
+            || !session.tcp_partial_writes.is_empty();
+
+        let timeout = if has_active_streams {
             Some(std::time::Duration::from_millis(50))
         } else {
-            None
-        });
+            session
+                .conn
+                .timeout()
+                .map(|t| t.min(time_to_next_ping))
+                .or(Some(time_to_next_ping))
+        };
         poll.poll(&mut events, timeout).unwrap();
+
+        if last_ping.elapsed() >= ping_interval {
+            if session.send_ping() {
+                let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+            }
+            last_ping = std::time::Instant::now();
+        }
 
         let pending_ids: Vec<u64> = session.quic_partial_writes.keys().copied().collect();
         for stream_id in pending_ids {
@@ -286,6 +302,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let Some(stream_id) = session.token_to_stream_id.get(&token).copied() else {
                         continue;
                     };
+                    if !session.tcp_streams.contains_key(&stream_id) {
+                        continue;
+                    }
 
                     let mut tcp_closed = false;
 
