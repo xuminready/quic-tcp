@@ -14,6 +14,7 @@ pub fn get_quic_config() -> quiche::Config {
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
-    config.set_max_idle_timeout(30000);
+    config.set_max_idle_timeout(60000);
+    config.set_cc_algorithm(quiche::CongestionControlAlgorithm::CUBIC);
     config
 }

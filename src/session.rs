@@ -2,7 +2,7 @@ use crate::{
     MAX_DATAGRAM_SIZE,
     utils::{interrupted, would_block},
 };
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use mio::net::UdpSocket;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
@@ -52,6 +52,10 @@ pub struct Session {
     pub quic_read_done: HashSet<u64>,
     /// Streams that have finished reading from TCP and writing to QUIC.
     pub tcp_read_done: HashSet<u64>,
+    /// Mutual passcode authentication status.
+    pub is_authenticated: bool,
+    pub auth_sent: bool,
+    pub auth_verified: bool,
 }
 
 impl Session {
@@ -65,6 +69,117 @@ impl Session {
             opened_streams: HashSet::new(),
             quic_read_done: HashSet::new(),
             tcp_read_done: HashSet::new(),
+            is_authenticated: false,
+            auth_sent: false,
+            auth_verified: false,
+        }
+    }
+
+    pub fn send_auth_packet(&mut self, passcode: &str) {
+        if !self.auth_sent && (self.conn.is_established() || self.conn.is_in_early_data()) {
+            let seq = crate::p2p::next_seq();
+            let payload = format!("AUTH:{}", seq);
+            let hmac = crate::p2p::compute_auth(passcode, &payload);
+            let msg = format!("AUTH {} {}\n", seq, hmac);
+            if let Ok(_) = self.conn.stream_send(0, msg.as_bytes(), false) {
+                self.auth_sent = true;
+                debug!("[Session] Sent AUTH handshake on stream 0 (seq={})", seq);
+            }
+        }
+    }
+
+    /// Handles auth frame on stream 0 for server side.
+    /// Returns Ok(true) if newly authenticated, Ok(false) if still waiting, or Err if auth failed/replayed.
+    pub fn process_server_auth(
+        &mut self,
+        passcode: &str,
+        replay_filter: &mut crate::p2p::ReplayFilter,
+    ) -> Result<bool, String> {
+        let mut buf = [0u8; 1024];
+        match self.conn.stream_recv(0, &mut buf) {
+            Ok((len, _fin)) if len > 0 => {
+                let msg = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
+                let parts: Vec<&str> = msg.split_whitespace().collect();
+                if parts.len() >= 3 && parts[0] == "AUTH" {
+                    let seq = parts[1].parse::<u64>().unwrap_or(0);
+                    let hmac = parts[2];
+                    let payload = format!("AUTH:{}", seq);
+
+                    if !replay_filter.check_and_add(seq) {
+                        let _ = self.conn.stream_send(0, b"ERR Replay attack detected: duplicate or stale sequence number\n", true);
+                        self.conn.close(true, 0x02, b"Replay attack detected").ok();
+                        return Err(format!("Replay attack detected: duplicate or stale sequence number {}", seq));
+                    }
+
+                    if !crate::p2p::verify_auth(passcode, &payload, hmac) {
+                        let _ = self.conn.stream_send(0, b"ERR Authentication failed: invalid server passcode\n", true);
+                        self.conn.close(true, 0x01, b"Authentication failed: invalid server passcode").ok();
+                        return Err("Authentication failed: invalid server passcode".to_string());
+                    }
+
+                    // Authenticated successfully!
+                    self.is_authenticated = true;
+                    let resp_seq = crate::p2p::next_seq();
+                    let resp_payload = format!("AUTH_OK:{}", resp_seq);
+                    let resp_hmac = crate::p2p::compute_auth(passcode, &resp_payload);
+                    let resp_msg = format!("AUTH_OK {} {}\n", resp_seq, resp_hmac);
+                    self.conn.stream_send(0, resp_msg.as_bytes(), false).ok();
+                    debug!("[Session] Server authenticated client on stream 0 (seq={})", seq);
+                    Ok(true)
+                } else {
+                    let err = format!("Invalid auth packet format on stream 0: {}", msg);
+                    let _ = self.conn.stream_send(0, b"ERR Invalid auth packet format\n", true);
+                    self.conn.close(true, 0x03, b"Invalid auth packet format").ok();
+                    Err(err)
+                }
+            }
+            Ok(_) => Ok(false),
+            Err(quiche::Error::Done) => Ok(false),
+            Err(e) => Err(format!("Stream recv error on stream 0: {:?}", e)),
+        }
+    }
+
+    /// Handles auth response on stream 0 for client side.
+    /// Returns Ok(true) if server verified, Ok(false) if waiting, or Err if auth failed/rejected.
+    pub fn process_client_auth_reply(
+        &mut self,
+        passcode: &str,
+        replay_filter: &mut crate::p2p::ReplayFilter,
+    ) -> Result<bool, String> {
+        let mut buf = [0u8; 1024];
+        match self.conn.stream_recv(0, &mut buf) {
+            Ok((len, _fin)) if len > 0 => {
+                let msg = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
+                let parts: Vec<&str> = msg.split_whitespace().collect();
+                if parts.len() >= 3 && parts[0] == "AUTH_OK" {
+                    let seq = parts[1].parse::<u64>().unwrap_or(0);
+                    let hmac = parts[2];
+                    let payload = format!("AUTH_OK:{}", seq);
+
+                    if !replay_filter.check_and_add(seq) {
+                        self.conn.close(true, 0x02, b"Replay attack detected").ok();
+                        return Err(format!("Replay attack on AUTH_OK: seq {}", seq));
+                    }
+
+                    if !crate::p2p::verify_auth(passcode, &payload, hmac) {
+                        self.conn.close(true, 0x01, b"Authentication failed: invalid server passcode").ok();
+                        return Err("Server auth reply HMAC invalid".to_string());
+                    }
+
+                    self.is_authenticated = true;
+                    self.auth_verified = true;
+                    debug!("[Session] Client verified server on stream 0 (seq={})", seq);
+                    Ok(true)
+                } else if parts.len() >= 2 && parts[0] == "ERR" {
+                    self.conn.close(true, 0x01, b"Authentication rejected by server").ok();
+                    Err(format!("Server rejected authentication: {}", msg))
+                } else {
+                    Err(format!("Unexpected message on auth stream 0: {}", msg))
+                }
+            }
+            Ok(_) => Ok(false),
+            Err(quiche::Error::Done) => Ok(false),
+            Err(e) => Err(format!("Stream recv error on stream 0: {:?}", e)),
         }
     }
 
@@ -156,16 +271,6 @@ impl Session {
                 self.tcp_partial_writes.remove(&stream_id);
                 Err(e)
             }
-        }
-    }
-
-    /// Sends an ACK-eliciting PING frame to keep the connection and NAT UDP mappings alive.
-    pub fn send_ping(&mut self) -> bool {
-        if self.conn.is_established() || self.conn.is_in_early_data() {
-            info!("Sending periodic QUIC PING to keep NAT mapping alive");
-            self.conn.send_ack_eliciting().is_ok()
-        } else {
-            false
         }
     }
 

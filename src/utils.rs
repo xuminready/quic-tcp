@@ -23,9 +23,12 @@ pub fn next_token(current: &mut mio::Token) -> mio::Token {
 
 pub fn next_stream_id(current: &mut u64) -> u64 {
     const MAX_STREAM_ID: u64 = (1 << 62) - 1;
+    if *current == 0 {
+        *current = 4;
+    }
     if *current > MAX_STREAM_ID - 4 {
-        log::warn!("Stream ID space exhausted. Resetting to 0.");
-        *current = 0;
+        log::warn!("Stream ID space exhausted. Resetting to 4.");
+        *current = 4;
     }
     let next = *current;
     *current += 4;
@@ -53,13 +56,13 @@ mod tests {
     #[test]
     fn test_next_stream_id() {
         let mut id = 0;
-        assert_eq!(next_stream_id(&mut id), 0);
         assert_eq!(next_stream_id(&mut id), 4);
+        assert_eq!(next_stream_id(&mut id), 8);
 
         let mut limit_id = ((1 << 62) - 1) - 2;
-        // Since limit_id > MAX_STREAM_ID - 4, this call resets it to 0 and returns 0
-        assert_eq!(next_stream_id(&mut limit_id), 0);
-        // The subsequent call returns 4
+        // Since limit_id > MAX_STREAM_ID - 4, this call resets it to 4 and returns 4
         assert_eq!(next_stream_id(&mut limit_id), 4);
+        // The subsequent call returns 8
+        assert_eq!(next_stream_id(&mut limit_id), 8);
     }
 }
