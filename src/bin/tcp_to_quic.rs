@@ -359,6 +359,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
 
+                        let pkt_buf = &mut buf[..len];
+
+                        if let Some(ref info) = p2p_ctx {
+                            if from == info.rendezvous_addr {
+                                debug!("Ignoring packet from Rendezvous Server in client data loop");
+                                continue 'read;
+                            }
+                        }
+
+                        if pkt_buf.starts_with(b"PEER_") {
+                            debug!("Ignoring trailing hole punch probe from {}", from);
+                            continue 'read;
+                        }
+
                         if from == peer_addr {
                             last_recv_time = Instant::now();
                         }
@@ -368,8 +382,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             from,
                         };
 
-                        if let Err(e) = session.conn.recv(&mut buf[..len], recv_info) {
-                            error!("recv failed: {:?}", e);
+                        if let Err(e) = session.conn.recv(pkt_buf, recv_info) {
+                            debug!("recv failed: {:?}", e);
                             continue 'read;
                         }
                     }

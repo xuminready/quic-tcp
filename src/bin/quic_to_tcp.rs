@@ -322,17 +322,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 .unwrap();
                                             info.last_keepalive = Instant::now();
                                             info.status = "BUSY".to_string();
-                                            continue 'read;
                                         }
                                     }
+                                } else {
+                                    debug!("Received control packet from Rendezvous Server: {}", text);
                                 }
+                                continue 'read;
                             }
+                        }
+
+                        // Ignore trailing UDP hole punching probes from peer
+                        if pkt_buf.starts_with(b"PEER_") {
+                            debug!("Ignoring trailing hole punch probe from {}", from);
+                            continue 'read;
                         }
 
                         let hdr = match quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
                             Ok(v) => v,
                             Err(e) => {
-                                error!("Failed to parse QUIC header: {:?}", e);
+                                debug!("Failed to parse QUIC header: {:?}", e);
                                 continue 'read;
                             }
                         };
@@ -341,7 +349,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let session = if !sessions.contains_key(&conn_id) {
                             if hdr.ty != quiche::Type::Initial {
-                                error!("Packet is not Initial");
+                                debug!("Ignoring non-Initial packet for unknown connection from {}", from);
                                 continue 'read;
                             }
 
