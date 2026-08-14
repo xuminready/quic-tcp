@@ -1,5 +1,7 @@
+pub mod auth;
 pub mod config;
 pub mod p2p;
+pub mod protocol;
 pub mod session;
 pub mod token;
 pub mod utils;
@@ -9,11 +11,15 @@ pub const TCP_TOKEN: mio::Token = mio::Token(0);
 pub const UDP_TOKEN: mio::Token = mio::Token(1);
 
 // Re-exports for convenience
+pub use auth::{compute_auth, next_seq, verify_auth, ReplayFilter};
 pub use config::get_quic_config;
 pub use p2p::{
-    compute_auth, next_seq, perform_hole_punching, reconnect_client_p2p_handshake,
-    run_client_p2p_handshake, run_server_p2p_handshake, send_server_keepalive,
-    send_server_status, server_handle_reconnect_punch, verify_auth,
+    perform_hole_punching, reconnect_client_p2p_handshake, run_client_p2p_handshake,
+    run_server_p2p_handshake, send_server_keepalive, send_server_status,
+    server_handle_reconnect_punch,
+};
+pub use protocol::{
+    ClientConn, ClientReset, PeerProbe, PunchSignal, RegOk, ServerReg, ServerStatusMsg,
 };
 pub use session::{FlushStatus, PartialWrite, Session, flush_quic_to_udp};
 pub use token::{mint_token, validate_token};

@@ -77,9 +77,9 @@ impl Session {
 
     pub fn send_auth_packet(&mut self, passcode: &str) {
         if !self.auth_sent && (self.conn.is_established() || self.conn.is_in_early_data()) {
-            let seq = crate::p2p::next_seq();
+            let seq = crate::auth::next_seq();
             let payload = format!("AUTH:{}", seq);
-            let hmac = crate::p2p::compute_auth(passcode, &payload);
+            let hmac = crate::auth::compute_auth(passcode, &payload);
             let msg = format!("AUTH {} {}\n", seq, hmac);
             if let Ok(_) = self.conn.stream_send(0, msg.as_bytes(), false) {
                 self.auth_sent = true;
@@ -93,7 +93,7 @@ impl Session {
     pub fn process_server_auth(
         &mut self,
         passcode: &str,
-        replay_filter: &mut crate::p2p::ReplayFilter,
+        replay_filter: &mut crate::auth::ReplayFilter,
     ) -> Result<bool, String> {
         let mut buf = [0u8; 1024];
         match self.conn.stream_recv(0, &mut buf) {
@@ -111,7 +111,7 @@ impl Session {
                         return Err(format!("Replay attack detected: duplicate or stale sequence number {}", seq));
                     }
 
-                    if !crate::p2p::verify_auth(passcode, &payload, hmac) {
+                    if !crate::auth::verify_auth(passcode, &payload, hmac) {
                         let _ = self.conn.stream_send(0, b"ERR Authentication failed: invalid server passcode\n", true);
                         self.conn.close(true, 0x01, b"Authentication failed: invalid server passcode").ok();
                         return Err("Authentication failed: invalid server passcode".to_string());
@@ -119,9 +119,9 @@ impl Session {
 
                     // Authenticated successfully!
                     self.is_authenticated = true;
-                    let resp_seq = crate::p2p::next_seq();
+                    let resp_seq = crate::auth::next_seq();
                     let resp_payload = format!("AUTH_OK:{}", resp_seq);
-                    let resp_hmac = crate::p2p::compute_auth(passcode, &resp_payload);
+                    let resp_hmac = crate::auth::compute_auth(passcode, &resp_payload);
                     let resp_msg = format!("AUTH_OK {} {}\n", resp_seq, resp_hmac);
                     self.conn.stream_send(0, resp_msg.as_bytes(), false).ok();
                     debug!("[Session] Server authenticated client on stream 0 (seq={})", seq);
@@ -144,7 +144,7 @@ impl Session {
     pub fn process_client_auth_reply(
         &mut self,
         passcode: &str,
-        replay_filter: &mut crate::p2p::ReplayFilter,
+        replay_filter: &mut crate::auth::ReplayFilter,
     ) -> Result<bool, String> {
         let mut buf = [0u8; 1024];
         match self.conn.stream_recv(0, &mut buf) {
@@ -161,7 +161,7 @@ impl Session {
                         return Err(format!("Replay attack on AUTH_OK: seq {}", seq));
                     }
 
-                    if !crate::p2p::verify_auth(passcode, &payload, hmac) {
+                    if !crate::auth::verify_auth(passcode, &payload, hmac) {
                         self.conn.close(true, 0x01, b"Authentication failed: invalid server passcode").ok();
                         return Err("Server auth reply HMAC invalid".to_string());
                     }

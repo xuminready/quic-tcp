@@ -1,107 +1,185 @@
 use log::{debug, error, info, warn};
-use quic_tcp::p2p::ReplayFilter;
+use quic_tcp::auth::ReplayFilter;
 use quic_tcp::*;
 use ring::rand::{SecureRandom, SystemRandom};
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
-struct P2pClientInfo {
-    rendezvous_addr: std::net::SocketAddr,
+struct P2pClientContext {
+    rendezvous_addr: SocketAddr,
     server_passcode: String,
     target_tcp_port: u16,
     target_name: String,
     std_socket_raw: std::net::UdpSocket,
 }
 
+enum ClientMode {
+    Direct {
+        local_tcp_addr: SocketAddr,
+        remote_udp_addr: SocketAddr,
+        server_passcode: String,
+    },
+    P2p {
+        rendezvous_addr: SocketAddr,
+        server_passcode: String,
+        target_tcp_port: u16,
+        local_tcp_addr: SocketAddr,
+    },
+}
+
+impl ClientMode {
+    fn from_args(args: &[String]) -> Result<Self, String> {
+        if args.len() < 2 {
+            return Err("Not enough arguments".to_string());
+        }
+
+        if args[1] == "p2p" {
+            if args.len() < 6 {
+                return Err("Missing required P2P arguments".to_string());
+            }
+            let rendezvous_addr: SocketAddr = args[2]
+                .parse()
+                .map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
+            let server_passcode = args[3].clone();
+            let target_tcp_port: u16 = args[4]
+                .parse()
+                .map_err(|e| format!("Invalid Target TCP port: {}", e))?;
+            let local_tcp_addr: SocketAddr = args[5]
+                .parse()
+                .map_err(|e| format!("Invalid TCP local address: {}", e))?;
+
+            Ok(ClientMode::P2p {
+                rendezvous_addr,
+                server_passcode,
+                target_tcp_port,
+                local_tcp_addr,
+            })
+        } else {
+            if args.len() < 3 {
+                return Err("Missing required Direct Mode arguments".to_string());
+            }
+            let local_tcp_addr: SocketAddr = args[1]
+                .parse()
+                .map_err(|e| format!("Invalid TCP local address: {}", e))?;
+            let remote_udp_addr: SocketAddr = args[2]
+                .parse()
+                .map_err(|e| format!("Invalid UDP remote address: {}", e))?;
+            let server_passcode = if args.len() > 3 {
+                args[3].clone()
+            } else {
+                "secret123".to_string()
+            };
+
+            Ok(ClientMode::Direct {
+                local_tcp_addr,
+                remote_udp_addr,
+                server_passcode,
+            })
+        }
+    }
+}
+
+fn create_quic_connection(
+    peer_addr: SocketAddr,
+    local_addr: SocketAddr,
+    config: &mut quiche::Config,
+) -> Session {
+    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+    SystemRandom::new().fill(&mut scid[..]).unwrap();
+    let scid = quiche::ConnectionId::from_ref(&scid);
+
+    let quic_conn = quiche::connect(
+        Some(peer_addr.to_string().as_str()),
+        &scid,
+        local_addr,
+        peer_addr,
+        config,
+    )
+    .unwrap();
+
+    info!("Initiating QUIC handshake with peer {}...", peer_addr);
+    info!(
+        "Connecting to {} from {} with scid {}",
+        peer_addr,
+        local_addr,
+        hex_dump(&scid)
+    );
+
+    Session::new(quic_conn)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        print_usage(&args[0]);
-        return Ok(());
-    }
+    let mode = match ClientMode::from_args(&args) {
+        Ok(m) => m,
+        Err(_) => {
+            print_usage(&args[0]);
+            return Ok(());
+        }
+    };
 
     let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
 
-    let mut p2p_client_info: Option<P2pClientInfo> = None;
-    let mut server_passcode = "secret123".to_string();
+    let mut p2p_ctx: Option<P2pClientContext> = None;
+    let server_passcode: String;
 
-    let (mut udp_socket, mut peer_addr, tcp_local_addr) = if args[1] == "p2p" {
-        if args.len() < 6 {
-            print_usage(&args[0]);
-            return Ok(());
-        }
-        let rendezvous_addr: std::net::SocketAddr = args[2]
-            .parse()
-            .map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
-        let passcode = &args[3];
-        server_passcode = passcode.to_string();
-        let target_tcp_port: u16 = args[4]
-            .parse()
-            .map_err(|e| format!("Invalid Target TCP port: {}", e))?;
-        let tcp_local_addr_str = &args[5];
-        let tcp_local_addr: std::net::SocketAddr = tcp_local_addr_str
-            .parse()
-            .map_err(|e| format!("Invalid TCP local address: {}", e))?;
-
-        println!(
-            "P2P Mode: connecting to Rendezvous Server {} for target TCP Port {}",
-            rendezvous_addr, target_tcp_port
-        );
-        println!("TCP Local Server: {}", tcp_local_addr);
-
-        let (std_socket, peer_addr, target_name) =
-            run_client_p2p_handshake(rendezvous_addr, passcode, target_tcp_port)?;
-        info!("UDP hole punching succeeded on client side with peer {}", peer_addr);
-        println!("UDP hole punching succeeded on client side with peer {}", peer_addr);
-        let std_socket_raw = std_socket.try_clone()?;
-        std_socket.set_nonblocking(true)?;
-        let udp_socket = mio::net::UdpSocket::from_std(std_socket);
-        p2p_client_info = Some(P2pClientInfo {
+    let (mut udp_socket, mut peer_addr, tcp_local_addr) = match mode {
+        ClientMode::P2p {
             rendezvous_addr,
-            server_passcode: passcode.to_string(),
+            server_passcode: pass,
             target_tcp_port,
-            target_name,
-            std_socket_raw,
-        });
-        (udp_socket, peer_addr, tcp_local_addr)
-    } else {
-        if args.len() < 3 {
-            print_usage(&args[0]);
-            return Ok(());
+            local_tcp_addr,
+        } => {
+            server_passcode = pass.clone();
+            println!(
+                "P2P Mode: connecting to Rendezvous Server {} for target TCP Port {}",
+                rendezvous_addr, target_tcp_port
+            );
+            println!("TCP Local Server: {}", local_tcp_addr);
+
+            let (std_socket, peer_addr, target_name) =
+                run_client_p2p_handshake(rendezvous_addr, &pass, target_tcp_port)?;
+            info!("UDP hole punching succeeded on client side with peer {}", peer_addr);
+            println!("UDP hole punching succeeded on client side with peer {}", peer_addr);
+
+            let std_socket_raw = std_socket.try_clone()?;
+            std_socket.set_nonblocking(true)?;
+            let udp_socket = mio::net::UdpSocket::from_std(std_socket);
+
+            p2p_ctx = Some(P2pClientContext {
+                rendezvous_addr,
+                server_passcode: pass,
+                target_tcp_port,
+                target_name,
+                std_socket_raw,
+            });
+
+            (udp_socket, peer_addr, local_tcp_addr)
         }
-        let tcp_local_addr_str = &args[1];
-        let udp_remote_addr_str = &args[2];
-        if args.len() > 3 {
-            server_passcode = args[3].clone();
+        ClientMode::Direct {
+            local_tcp_addr,
+            remote_udp_addr,
+            server_passcode: pass,
+        } => {
+            server_passcode = pass;
+            println!("Direct Mode: connecting to Remote QUIC Server {}", remote_udp_addr);
+            println!("TCP Local Server: {}", local_tcp_addr);
+
+            let bind_addr = match remote_udp_addr {
+                SocketAddr::V4(_) => "0.0.0.0:0",
+                SocketAddr::V6(_) => "[::]:0",
+            };
+            let udp_socket = mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
+            (udp_socket, remote_udp_addr, local_tcp_addr)
         }
-
-        let tcp_local_addr: std::net::SocketAddr = tcp_local_addr_str
-            .parse()
-            .map_err(|e| format!("Invalid TCP local address: {}", e))?;
-        let udp_remote_addr: std::net::SocketAddr = udp_remote_addr_str
-            .parse()
-            .map_err(|e| format!("Invalid UDP remote address: {}", e))?;
-
-        println!(
-            "Direct Mode: connecting to Remote QUIC Server {}",
-            udp_remote_addr
-        );
-        println!("TCP Local Server: {}", tcp_local_addr);
-
-        let bind_addr = match udp_remote_addr {
-            std::net::SocketAddr::V4(_) => "0.0.0.0:0",
-            std::net::SocketAddr::V6(_) => "[::]:0",
-        };
-        let udp_socket = mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
-        (udp_socket, udp_remote_addr, tcp_local_addr)
     };
 
     let mut tcp_server = mio::net::TcpListener::bind(tcp_local_addr).unwrap();
-    info!(
-        "TCP listener bound to {}, waiting for local connections.",
-        tcp_local_addr
-    );
+    info!("TCP listener bound to {}, waiting for local connections.", tcp_local_addr);
+
     poll.registry()
         .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)
         .unwrap();
@@ -111,72 +189,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap();
 
     let mut config = get_quic_config();
-
-    let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-    SystemRandom::new().fill(&mut scid[..]).unwrap();
-    let scid = quiche::ConnectionId::from_ref(&scid);
-
     let local_addr = udp_socket.local_addr().unwrap();
-    let quic_connection = quiche::connect(
-        Some(peer_addr.to_string().as_str()),
-        &scid,
-        local_addr,
-        peer_addr,
-        &mut config,
-    )
-    .unwrap();
-
-    info!("Initiating QUIC handshake with peer {}...", peer_addr);
-    info!(
-        "connecting to {:} from {:} with scid {}",
-        peer_addr,
-        udp_socket.local_addr().unwrap(),
-        hex_dump(&scid)
-    );
-
-    let mut session = Session::new(quic_connection);
+    let mut session = create_quic_connection(peer_addr, local_addr, &mut config);
     let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
 
-    let mut current_stream_id: u64 = 4;
+    let mut current_stream_id: u64 = 4; // Streams start at 4 (stream 0 reserved for auth)
     let mut unique_token = mio::Token(UDP_TOKEN.0 + 1);
     let mut was_established = false;
-    let mut last_recv_time = std::time::Instant::now();
-    let mut last_probe_time = std::time::Instant::now();
+    let mut last_recv_time = Instant::now();
+    let mut last_probe_time = Instant::now();
     let mut auth_filter = ReplayFilter::new();
 
     loop {
-        let timeout = session.conn.timeout().or(if !session.tcp_streams.is_empty()
+        let has_active_streams = !session.tcp_streams.is_empty()
             || !session.quic_partial_writes.is_empty()
-            || !session.tcp_partial_writes.is_empty()
-        {
-            Some(std::time::Duration::from_millis(50))
-        } else if p2p_client_info.is_some() {
-            Some(std::time::Duration::from_secs(1))
-        } else {
-            None
-        });
+            || !session.tcp_partial_writes.is_empty();
+        let mut timeout = session.conn.timeout();
+        if has_active_streams {
+            timeout = Some(std::cmp::min(
+                timeout.unwrap_or(Duration::from_millis(50)),
+                Duration::from_millis(50),
+            ));
+        } else if p2p_ctx.is_some() {
+            timeout = Some(std::cmp::min(
+                timeout.unwrap_or(Duration::from_secs(1)),
+                Duration::from_secs(1),
+            ));
+        }
         poll.poll(&mut events, timeout).unwrap();
 
-        // Send auth packet as soon as early data or established is ready
+        // Send stream 0 auth packet as soon as early data or established is ready
         session.send_auth_packet(&server_passcode);
 
         // Send periodic PING keepalive frames every 5s in P2P mode to keep NAT mapping alive
-        if p2p_client_info.is_some()
-            && last_probe_time.elapsed() >= std::time::Duration::from_secs(5)
-        {
+        if p2p_ctx.is_some() && last_probe_time.elapsed() >= Duration::from_secs(5) {
             if session.conn.is_established() || session.conn.is_in_early_data() {
-                debug!("Sending periodic PING keepalive frame to maintain NAT mapping with peer {}", peer_addr);
+                debug!("Sending periodic PING keepalive to maintain NAT mapping with peer {}", peer_addr);
                 session.conn.send_ack_eliciting().ok();
                 let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
             }
-            last_probe_time = std::time::Instant::now();
+            last_probe_time = Instant::now();
         }
 
+        // Detect socket reachability and handle automatic reconnection in P2P mode
         let unreachability_reason = if session.conn.is_closed() {
             Some(format!("QUIC connection closed ({:?})", session.conn.stats()))
-        } else if p2p_client_info.is_some()
+        } else if p2p_ctx.is_some()
             && session.conn.is_established()
-            && last_recv_time.elapsed() > std::time::Duration::from_secs(15)
+            && last_recv_time.elapsed() > Duration::from_secs(15)
         {
             Some(format!(
                 "No response to periodic PINGs received from server for {:.1}s",
@@ -187,16 +247,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         if let Some(reason) = unreachability_reason {
-            if let Some(ref info) = p2p_client_info {
+            if let Some(ref info) = p2p_ctx {
                 warn!(
-                    "Hole punched UDP connection to server '{}' ({}) is no longer usable: {}. Reporting to Rendezvous Server and starting over UDP hole punching process...",
+                    "Hole punched UDP connection to server '{}' ({}) is no longer usable: {}. Reporting to Rendezvous Server and restarting hole punching...",
                     info.target_name, peer_addr, reason
                 );
                 println!(
-                    "WARNING: Hole punched UDP socket to server '{}' ({}) is no longer usable ({}). Reporting to Rendezvous Server and starting over UDP hole punching process...",
+                    "WARNING: Hole punched UDP socket to server '{}' ({}) is no longer usable ({}). Reporting to Rendezvous Server and restarting hole punching...",
                     info.target_name, peer_addr, reason
                 );
 
+                // Drain and deregister active TCP streams
                 for (_, mut tcp_stream) in session.tcp_streams.drain() {
                     poll.registry().deregister(&mut tcp_stream).ok();
                 }
@@ -217,31 +278,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info.target_tcp_port,
                 ) {
                     Ok(addr) => {
-                        info!(
-                            "UDP hole punching restart succeeded! Restored endpoint: {}",
-                            addr
-                        );
-                        println!(
-                            "UDP hole punching restart succeeded! Restored endpoint: {}",
-                            addr
-                        );
+                        info!("UDP hole punching restart succeeded! Restored endpoint: {}", addr);
+                        println!("UDP hole punching restart succeeded! Restored endpoint: {}", addr);
                         addr
                     }
                     Err(e) => {
-                        error!(
-                            "[P2P Client ERROR] UDP hole punching reconnection failed: {}. Will retry on next probe interval.",
-                            e
-                        );
-                        eprintln!(
-                            "[P2P Client ERROR] UDP hole punching reconnection failed: {}. Will retry on next probe interval.",
-                            e
-                        );
+                        error!("[P2P Client ERROR] UDP hole punching reconnection failed: {}. Retrying on next interval.", e);
+                        eprintln!("[P2P Client ERROR] UDP hole punching reconnection failed: {}. Retrying on next interval.", e);
                         info.std_socket_raw.set_nonblocking(true).ok();
                         poll.registry()
                             .register(&mut udp_socket, UDP_TOKEN, mio::Interest::READABLE)
                             .unwrap();
-                        last_probe_time = std::time::Instant::now();
-                        last_recv_time = std::time::Instant::now();
+                        last_probe_time = Instant::now();
+                        last_recv_time = Instant::now();
                         continue;
                     }
                 };
@@ -252,30 +301,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .register(&mut udp_socket, UDP_TOKEN, mio::Interest::READABLE)
                     .unwrap();
 
-                let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-                SystemRandom::new().fill(&mut scid[..]).unwrap();
-                let scid = quiche::ConnectionId::from_ref(&scid);
-                let local_addr = udp_socket.local_addr().unwrap();
-                let quic_connection = quiche::connect(
-                    Some(peer_addr.to_string().as_str()),
-                    &scid,
-                    local_addr,
-                    peer_addr,
-                    &mut config,
-                )
-                .unwrap();
-                session = Session::new(quic_connection);
+                session = create_quic_connection(peer_addr, local_addr, &mut config);
                 let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
                 was_established = false;
                 current_stream_id = 4;
-                last_recv_time = std::time::Instant::now();
+                last_recv_time = Instant::now();
                 continue;
             } else {
-                info!("connection closed, {:?}", session.conn.stats());
+                info!("Direct connection closed: {:?}", session.conn.stats());
                 return Ok(());
             }
         }
 
+        // Flush pending queued writes
         let pending_ids: Vec<u64> = session.quic_partial_writes.keys().copied().collect();
         for stream_id in pending_ids {
             session.flush_pending_quic_write(stream_id);
@@ -309,14 +347,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for event in events.iter() {
             match event.token() {
                 UDP_TOKEN => {
-                    debug!("UDP client read event");
                     let mut buf = [0; 65535];
                     'read: loop {
                         let (len, from) = match udp_socket.recv_from(&mut buf) {
                             Ok(v) => v,
                             Err(e) => {
                                 if e.kind() == std::io::ErrorKind::WouldBlock {
-                                    debug!("recv() would block");
                                     break 'read;
                                 }
                                 panic!("recv() failed: {e:?}");
@@ -324,32 +360,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
 
                         if from == peer_addr {
-                            last_recv_time = std::time::Instant::now();
+                            last_recv_time = Instant::now();
                         }
 
-                        debug!("UDP got {len} bytes");
                         let recv_info = quiche::RecvInfo {
-                            to: udp_socket.local_addr().unwrap(),
+                            to: local_addr,
                             from,
                         };
 
-                        let read = match session.conn.recv(&mut buf[..len], recv_info) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                error!("recv failed: {:?}", e);
-                                continue 'read;
-                            }
-                        };
-                        debug!("processed {read} bytes");
+                        if let Err(e) = session.conn.recv(&mut buf[..len], recv_info) {
+                            error!("recv failed: {:?}", e);
+                            continue 'read;
+                        }
                     }
 
-                    debug!("done reading");
-
-                    if session.conn.is_closed() {
-                        if p2p_client_info.is_none() {
-                            info!("connection closed, {:?}", session.conn.stats());
-                            return Ok(());
-                        }
+                    if session.conn.is_closed() && p2p_ctx.is_none() {
+                        info!("Connection closed: {:?}", session.conn.stats());
+                        return Ok(());
                     }
 
                     if session.conn.is_established() && !was_established {
@@ -360,7 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Send auth packet if not sent yet
                     session.send_auth_packet(&server_passcode);
 
-                    // Process all readable streams.
+                    // Process all readable streams
                     for stream_id in session.conn.readable() {
                         if stream_id == 0 {
                             match session.process_client_auth_reply(&server_passcode, &mut auth_filter) {
@@ -379,60 +406,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         session.opened_streams.insert(stream_id);
                         if !session.tcp_streams.contains_key(&stream_id) {
-                            debug!(
-                                "Readable stream {} not found in tcp_streams (likely closed)",
-                                stream_id
-                            );
                             continue;
                         }
-                        let done = match session.forward_quic_to_tcp(stream_id, &mut poll) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                if quic_tcp::session::is_disconnect_error(&e) {
-                                    debug!("forward_quic_to_tcp stream {} disconnected: {}", stream_id, e);
-                                } else {
-                                    warn!("forward_quic_to_tcp failed: {:?}", e);
-                                }
-                                session.close_tcp_stream_by_id(stream_id, &mut poll);
-                                true
-                            }
-                        };
-                        if done {
-                            info!("fin response received");
-                        }
-                    }
-
-                    // Process all writable streams.
-                    for stream_id in session.conn.writable() {
-                        session.flush_pending_quic_write(stream_id);
-                        if !session.tcp_streams.contains_key(&stream_id) {
-                            continue;
-                        }
-                        if let Err(e) = session.forward_tcp_to_quic(stream_id, &mut poll) {
+                        if let Err(e) = session.forward_quic_to_tcp(stream_id, &mut poll) {
                             if quic_tcp::session::is_disconnect_error(&e) {
-                                debug!("forward_tcp_to_quic stream {} disconnected: {}", stream_id, e);
+                                debug!("forward_quic_to_tcp stream {} disconnected: {}", stream_id, e);
                             } else {
-                                warn!("forward_tcp_to_quic failed: {:?}", e);
+                                warn!("forward_quic_to_tcp failed: {:?}", e);
                             }
                             session.close_tcp_stream_by_id(stream_id, &mut poll);
                         }
                     }
 
-                    // Flush any pending QUIC writes that were buffered prior to connection establishment
-                    let pending_quic_ids: Vec<u64> = session.quic_partial_writes.keys().copied().collect();
-                    for stream_id in pending_quic_ids {
+                    // Process all writable streams
+                    for stream_id in session.conn.writable() {
                         session.flush_pending_quic_write(stream_id);
-                    }
-
-                    // Retry any pending writes or delayed TCP reads once connection is established
-                    let all_stream_ids: Vec<u64> = session.tcp_streams.keys().copied().collect();
-                    for stream_id in all_stream_ids {
-                        if session.tcp_streams.contains_key(&stream_id) && !session.quic_partial_writes.contains_key(&stream_id) {
+                        if session.tcp_streams.contains_key(&stream_id) {
                             if let Err(e) = session.forward_tcp_to_quic(stream_id, &mut poll) {
                                 if quic_tcp::session::is_disconnect_error(&e) {
                                     debug!("forward_tcp_to_quic stream {} disconnected: {}", stream_id, e);
                                 } else {
-                                    warn!("Failed to forward TCP to QUIC for stream {}: {:?}", stream_id, e);
+                                    warn!("forward_tcp_to_quic failed: {:?}", e);
                                 }
                                 session.close_tcp_stream_by_id(stream_id, &mut poll);
                             }
@@ -444,17 +438,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 TCP_TOKEN => loop {
                     let (mut tcp_stream, address) = match tcp_server.accept() {
                         Ok((tcp_stream, address)) => (tcp_stream, address),
-                        Err(e) if would_block(&e) => {
-                            break;
-                        }
+                        Err(e) if would_block(&e) => break,
                         Err(e) => {
-                            eprint!("{}", e);
+                            eprintln!("TCP Accept error: {}", e);
                             return Ok(());
                         }
                     };
 
                     info!("Accepted TCP connection from: {}", address);
-
                     let token = next_token(&mut unique_token);
                     poll.registry()
                         .register(
@@ -465,7 +456,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap();
 
                     let stream_id = next_stream_id(&mut current_stream_id);
-                    debug!("🟢 new stream id: {} for {} 🟢", stream_id, address);
+                    debug!("🟢 New stream id: {} for {} 🟢", stream_id, address);
                     session.token_to_stream_id.insert(token, stream_id);
                     session.tcp_streams.insert(stream_id, tcp_stream);
                 },
@@ -480,19 +471,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut tcp_closed = false;
 
                     if event.is_writable() {
-                        debug!("TCP client is writable");
                         match session.forward_quic_to_tcp(stream_id, &mut poll) {
-                            Ok(closed) => {
-                                if closed {
-                                    info!("forward_quic_to_tcp returned closed=true for stream {}", stream_id);
-                                    tcp_closed = true;
-                                }
-                            }
+                            Ok(closed) => tcp_closed = closed,
                             Err(e) => {
-                                if quic_tcp::session::is_disconnect_error(&e) {
-                                    debug!("forward_quic_to_tcp stream {} disconnected: {}", stream_id, e);
-                                } else {
-                                    warn!("forward_quic_to_tcp returned error for stream {}: {:?}", stream_id, e);
+                                if !quic_tcp::session::is_disconnect_error(&e) {
+                                    warn!("forward_quic_to_tcp error for stream {}: {:?}", stream_id, e);
                                 }
                                 tcp_closed = true;
                             }
@@ -500,19 +483,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if event.is_readable() && !tcp_closed {
-                        debug!("TCP client is readable");
                         match session.forward_tcp_to_quic(stream_id, &mut poll) {
-                            Ok(closed) => {
-                                if closed {
-                                    info!("forward_tcp_to_quic returned closed=true for stream {}", stream_id);
-                                    tcp_closed = true;
-                                }
-                            }
+                            Ok(closed) => tcp_closed = closed,
                             Err(e) => {
-                                if quic_tcp::session::is_disconnect_error(&e) {
-                                    debug!("forward_tcp_to_quic stream {} disconnected: {}", stream_id, e);
-                                } else {
-                                    warn!("forward_tcp_to_quic returned error for stream {}: {:?}", stream_id, e);
+                                if !quic_tcp::session::is_disconnect_error(&e) {
+                                    warn!("forward_tcp_to_quic error for stream {}: {:?}", stream_id, e);
                                 }
                                 tcp_closed = true;
                             }
@@ -520,7 +495,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     if tcp_closed {
-                        info!("🟢 done, close tcp stream {}", stream_id);
+                        info!("🟢 Closing TCP stream {}", stream_id);
                         session.close_tcp_stream_by_token(token, &mut poll);
                     }
                 }

@@ -1,75 +1,19 @@
 use log::{debug, error, info, warn};
-use std::collections::HashSet;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use crate::utils::hex_dump;
-
-pub fn compute_auth(passcode: &str, payload: &str) -> String {
-    let s_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, passcode.as_bytes());
-    let tag = ring::hmac::sign(&s_key, payload.as_bytes());
-    hex_dump(tag.as_ref())
-}
-
-pub fn verify_auth(passcode: &str, payload: &str, signature: &str) -> bool {
-    let expected = compute_auth(passcode, payload);
-    expected == signature
-}
-
-static SEQ_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-pub fn next_seq() -> u64 {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let cnt = SEQ_COUNTER.fetch_add(1, Ordering::Relaxed) % 1024;
-    (now_ms << 10) | cnt
-}
-
-#[derive(Debug, Clone)]
-pub struct ReplayFilter {
-    pub seen_seqs: HashSet<u64>,
-}
-
-impl ReplayFilter {
-    pub fn new() -> Self {
-        Self {
-            seen_seqs: HashSet::new(),
-        }
-    }
-
-    pub fn check_and_add(&mut self, seq: u64) -> bool {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let pkt_time_ms = seq >> 10;
-
-        // Verify window within 120 seconds of clock to prevent ancient replay packets
-        if pkt_time_ms > now_ms + 120_000 || now_ms.saturating_sub(pkt_time_ms) > 120_000 {
-            return false;
-        }
-
-        if self.seen_seqs.contains(&seq) {
-            return false; // Replay attack detected
-        }
-
-        self.seen_seqs.insert(seq);
-        if self.seen_seqs.len() > 10_000 {
-            self.seen_seqs.retain(|&s| {
-                let time_ms = s >> 10;
-                now_ms.saturating_sub(time_ms) <= 120_000
-            });
-        }
-        true
-    }
-}
+pub use crate::auth::{compute_auth, next_seq, verify_auth, ReplayFilter};
+use crate::protocol::{
+    ClientConn, ClientReset, PeerProbe, PunchSignal, RegOk, ServerReg, ServerStatusMsg,
+};
 
 /// Performs UDP hole punching between two peers with multi-round retries, progress logging, and replay-protected HMAC authentication.
-/// Returns the final learned SocketAddr of the peer or an Error if all retries fail.
+///
+/// Workflow:
+/// - Round 1..=3: Sends signed UDP probes (`PEER_PUNCH`, `PEER_PUNCH_ACK`, `PEER_PUNCH_ACK_ACK`).
+/// - Handles symmetric NAT port changes dynamically.
+/// - Returns the final learned `SocketAddr` of the remote peer.
 pub fn perform_hole_punching(
     socket: &UdpSocket,
     peer_addr: SocketAddr,
@@ -107,19 +51,16 @@ pub fn perform_hole_punching(
         );
 
         for attempt in 1..=attempts_per_round {
-            let seq = next_seq();
-            let (cmd, payload) = match current_step {
-                1 => ("PEER_PUNCH", format!("PEER_PUNCH:{}", seq)),
-                2 => ("PEER_PUNCH_ACK", format!("PEER_PUNCH_ACK:{}", seq)),
-                _ => ("PEER_PUNCH_ACK_ACK", format!("PEER_PUNCH_ACK_ACK:{}", seq)),
+            let probe_msg = match current_step {
+                1 => PeerProbe::new_punch(passcode),
+                2 => PeerProbe::new_ack(passcode),
+                _ => PeerProbe::new_ack_ack(passcode),
             };
-            let hmac = compute_auth(passcode, &payload);
-            let msg = format!("{} {} {}", cmd, seq, hmac);
-            socket.send_to(msg.as_bytes(), peer_addr)?;
+            socket.send_to(probe_msg.as_bytes(), peer_addr)?;
 
             debug!(
-                "[P2P Hole Punch] [Round {}/{} Probe #{}] Sent '{}' to {}",
-                round, max_rounds, attempt, cmd, peer_addr
+                "[P2P Hole Punch] [Round {}/{} Probe #{}] Sent step {} to {}",
+                round, max_rounds, attempt, current_step, peer_addr
             );
 
             if punched {
@@ -132,91 +73,91 @@ pub fn perform_hole_punching(
             match socket.recv_from(&mut buf) {
                 Ok((len, src)) => {
                     let text = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
-                    let parts: Vec<&str> = text.split_whitespace().collect();
-                    if src.ip() == peer_addr.ip() && parts.len() >= 3 {
-                        let cmd = parts[0];
-                        let pkt_seq = parts[1].parse::<u64>().unwrap_or(0);
-                        let pkt_hmac = parts[2];
-                        let expected_payload = format!("{}:{}", cmd, pkt_seq);
+                    if src.ip() == peer_addr.ip() {
+                        if let Some(probe) = PeerProbe::parse(text) {
+                            if !probe.verify(passcode) {
+                                debug!("[P2P Hole Punch] Dropping probe with invalid HMAC from {}", src);
+                                continue;
+                            }
+                            if !replay_filter.check_and_add(probe.seq()) {
+                                debug!(
+                                    "[P2P Hole Punch] Dropping replayed probe with seq {} from {}",
+                                    probe.seq(), src
+                                );
+                                continue;
+                            }
 
-                        if !verify_auth(passcode, &expected_payload, pkt_hmac) {
-                            debug!("[P2P Hole Punch] Dropping packet with invalid HMAC from {}", src);
-                            continue;
-                        }
-                        if !replay_filter.check_and_add(pkt_seq) {
-                            debug!("[P2P Hole Punch] Dropping replayed packet with seq {} from {}", pkt_seq, src);
-                            continue;
-                        }
+                            match probe {
+                                PeerProbe::Punch(..) => {
+                                    if current_step == 1 {
+                                        info!(
+                                            "[P2P Hole Punch] [Progress: Round {}/{}] STEP 1/3: Received direct probe from {}. Outbound NAT hole confirmed! Replying with PEER_PUNCH_ACK.",
+                                            round, max_rounds, src
+                                        );
+                                        println!(
+                                            "[P2P Hole Punch] [Progress: Round {}/{}] STEP 1/3: Received direct probe from {}. Outbound NAT hole confirmed! Replying with PEER_PUNCH_ACK.",
+                                            round, max_rounds, src
+                                        );
+                                        current_step = 2;
+                                    }
+                                }
+                                PeerProbe::Ack(..) => {
+                                    info!(
+                                        "[P2P Hole Punch] [Progress: Round {}/{}] STEP 2/3: Received PEER_PUNCH_ACK from {}. Bidirectional NAT mapping confirmed! Replying with PEER_PUNCH_ACK_ACK.",
+                                        round, max_rounds, src
+                                    );
+                                    println!(
+                                        "[P2P Hole Punch] [Progress: Round {}/{}] STEP 2/3: Received PEER_PUNCH_ACK from {}. Bidirectional NAT mapping confirmed! Replying with PEER_PUNCH_ACK_ACK.",
+                                        round, max_rounds, src
+                                    );
+                                    current_step = 3;
+                                    punched = true;
+                                }
+                                PeerProbe::AckAck(..) => {
+                                    info!(
+                                        "[P2P Hole Punch] [Progress: Round {}/{}] STEP 3/3: Received PEER_PUNCH_ACK_ACK from {}. 3-way handshake COMPLETE!",
+                                        round, max_rounds, src
+                                    );
+                                    println!(
+                                        "[P2P Hole Punch] [Progress: Round {}/{}] STEP 3/3: Received PEER_PUNCH_ACK_ACK from {}. 3-way handshake COMPLETE!",
+                                        round, max_rounds, src
+                                    );
+                                    punched = true;
+                                    for _ in 0..3 {
+                                        let final_ack = PeerProbe::new_ack_ack(passcode);
+                                        socket.send_to(final_ack.as_bytes(), peer_addr)?;
+                                    }
+                                    break;
+                                }
+                            }
 
-                        if cmd == "PEER_PUNCH" {
-                            if current_step == 1 {
+                            if src != peer_addr {
                                 info!(
-                                    "[P2P Hole Punch] [Progress: Round {}/{}] STEP 1/3: Received direct probe from {}. Outbound NAT hole confirmed! Replying with PEER_PUNCH_ACK.",
-                                    round, max_rounds, src
+                                    "[P2P Hole Punch] Discovered NAT reflexive endpoint: updating peer address from {} to {}",
+                                    peer_addr, src
                                 );
                                 println!(
-                                    "[P2P Hole Punch] [Progress: Round {}/{}] STEP 1/3: Received direct probe from {}. Outbound NAT hole confirmed! Replying with PEER_PUNCH_ACK.",
-                                    round, max_rounds, src
+                                    "[P2P Hole Punch] Discovered NAT reflexive endpoint: updating peer address from {} to {}",
+                                    peer_addr, src
                                 );
-                                current_step = 2;
+                                peer_addr = src;
                             }
-                        } else if cmd == "PEER_PUNCH_ACK" {
-                            info!(
-                                "[P2P Hole Punch] [Progress: Round {}/{}] STEP 2/3: Received PEER_PUNCH_ACK from {}. Bidirectional NAT mapping confirmed! Replying with PEER_PUNCH_ACK_ACK.",
-                                round, max_rounds, src
-                            );
-                            println!(
-                                "[P2P Hole Punch] [Progress: Round {}/{}] STEP 2/3: Received PEER_PUNCH_ACK from {}. Bidirectional NAT mapping confirmed! Replying with PEER_PUNCH_ACK_ACK.",
-                                round, max_rounds, src
-                            );
-                            current_step = 3;
-                            punched = true;
-                        } else if cmd == "PEER_PUNCH_ACK_ACK" {
-                            info!(
-                                "[P2P Hole Punch] [Progress: Round {}/{}] STEP 3/3: Received PEER_PUNCH_ACK_ACK from {}. 3-way handshake COMPLETE!",
-                                round, max_rounds, src
-                            );
-                            println!(
-                                "[P2P Hole Punch] [Progress: Round {}/{}] STEP 3/3: Received PEER_PUNCH_ACK_ACK from {}. 3-way handshake COMPLETE!",
-                                round, max_rounds, src
+                        } else if len > 0 && !text.starts_with("PEER_") {
+                            // Early data from peer (e.g. QUIC Initial packet)
+                            debug!(
+                                "[P2P Hole Punch] Received data packet (len={}) from peer {} during hole punch.",
+                                len, src
                             );
                             punched = true;
-                            for _ in 0..3 {
-                                let a_seq = next_seq();
-                                let a_payload = format!("PEER_PUNCH_ACK_ACK:{}", a_seq);
-                                let a_hmac = compute_auth(passcode, &a_payload);
-                                let a_msg = format!("PEER_PUNCH_ACK_ACK {} {}", a_seq, a_hmac);
-                                socket.send_to(a_msg.as_bytes(), peer_addr)?;
-                            }
                             break;
                         }
-
-                        if src != peer_addr {
-                            info!(
-                                "[P2P Hole Punch] Discovered NAT reflexive endpoint: updating peer address from {} to {}",
-                                peer_addr, src
-                            );
-                            println!(
-                                "[P2P Hole Punch] Discovered NAT reflexive endpoint: updating peer address from {} to {}",
-                                peer_addr, src
-                            );
-                            peer_addr = src;
-                        }
-                    } else if src.ip() == peer_addr.ip() && len > 0 && !parts.is_empty() && !parts[0].starts_with("PEER_") {
-                        // Received early data (e.g. QUIC Initial from peer who completed hole punch)
-                        debug!(
-                            "[P2P Hole Punch] Received data packet (len={}) from peer {} during hole punch.",
-                            len, src
-                        );
-                        punched = true;
-                        break;
                     }
                 }
                 Err(ref e)
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::TimedOut =>
                 {
-                    // Expected read timeout
+                    // Expected read timeout between probes
                 }
                 Err(e) => {
                     debug!("[P2P Hole Punch] recv error: {}", e);
@@ -266,6 +207,7 @@ pub fn perform_hole_punching(
     .into())
 }
 
+/// Orchestrates P2P registration and handshake for a `quic-to-tcp` server.
 pub fn run_server_p2p_handshake(
     rendezvous_addr: SocketAddr,
     name: &str,
@@ -288,29 +230,21 @@ pub fn run_server_p2p_handshake(
         rendezvous_addr, name, tcp_port
     );
     let mut reg_ok = false;
-    let last_err = String::new();
     for _ in 0..5 {
-        let seq = next_seq();
-        let payload = format!("REG:{}:{}:IDLE:{}:{}", name, tcp_port, server_passcode, seq);
-        let hmac = compute_auth(rendezvous_passcode, &payload);
-        let reg_msg = format!("REG {} {} IDLE {} {} {}", name, tcp_port, server_passcode, seq, hmac);
-
+        let reg_msg = ServerReg::new_signed(name, tcp_port, "IDLE", server_passcode, rendezvous_passcode);
         socket.send_to(reg_msg.as_bytes(), rendezvous_addr)?;
+
         match socket.recv_from(&mut buf) {
             Ok((len, src)) if src == rendezvous_addr => {
-                let reply = std::str::from_utf8(&buf[..len]).unwrap_or("");
-                let parts: Vec<&str> = reply.split_whitespace().collect();
-                if parts.len() >= 3 && parts[0] == "REG_OK" {
-                    let resp_seq = parts[1];
-                    let resp_hmac = parts[2];
-                    let expected_payload = format!("REG_OK:{}", resp_seq);
-                    if verify_auth(rendezvous_passcode, &expected_payload, resp_hmac) {
+                let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
+                if let Some(ok) = RegOk::parse(reply) {
+                    if ok.verify(rendezvous_passcode) {
                         reg_ok = true;
                         break;
                     } else {
                         return Err("Authentication failed on REG_OK reply from Rendezvous Server".into());
                     }
-                } else if parts.len() >= 2 && parts[0] == "ERR" {
+                } else if reply.starts_with("ERR") {
                     return Err(format!("Rendezvous Server rejected registration: {}", reply).into());
                 }
             }
@@ -319,53 +253,39 @@ pub fn run_server_p2p_handshake(
     }
 
     if !reg_ok {
-        let err_detail = if last_err.is_empty() {
-            "timeout or invalid rendezvous passcode".to_string()
-        } else {
-            last_err
-        };
         error!(
-            "[P2P Server ERROR] Failed to register at Rendezvous Server {} ({}). Giving up.",
-            rendezvous_addr, err_detail
+            "[P2P Server ERROR] Failed to register at Rendezvous Server {} (timeout or invalid rendezvous passcode). Giving up.",
+            rendezvous_addr
         );
         eprintln!(
-            "[P2P Server ERROR] Failed to register at Rendezvous Server {} ({}). Giving up.",
-            rendezvous_addr, err_detail
+            "[P2P Server ERROR] Failed to register at Rendezvous Server {} (timeout or invalid rendezvous passcode). Giving up.",
+            rendezvous_addr
         );
-        return Err(format!("Failed to register at Rendezvous Server: {}", err_detail).into());
+        return Err("Failed to register at Rendezvous Server: timeout or invalid rendezvous passcode".into());
     }
     println!("Registration successful at Rendezvous Server.");
 
-    // 2. Wait for authenticated PUNCH control request (signed with server_passcode)
+    // 2. Wait for authenticated PUNCH signal from Rendezvous Server
     socket.set_read_timeout(Some(Duration::from_secs(10)))?;
     println!("Waiting for peer connection (sending authenticated keep-alives every 10s)...");
     let peer_addr = loop {
         match socket.recv_from(&mut buf) {
-            Ok((len, src)) => {
-                if src == rendezvous_addr {
-                    let reply = std::str::from_utf8(&buf[..len]).unwrap_or("");
-                    let parts: Vec<&str> = reply.split_whitespace().collect();
-                    if parts.len() >= 5 && parts[0] == "PUNCH" {
-                        let client_addr_str = parts[1];
-                        let role = parts[2];
-                        let seq = parts[3];
-                        let hmac = parts[4];
-                        let expected_payload = format!("PUNCH:{}:{}:{}", client_addr_str, role, seq);
-                        if verify_auth(server_passcode, &expected_payload, hmac) {
-                            if role == "passive" {
-                                let addr: SocketAddr = client_addr_str.parse()?;
-                                break addr;
-                            }
-                        } else {
-                            warn!("Received unauthenticated PUNCH packet from Rendezvous Server, dropping.");
+            Ok((len, src)) if src == rendezvous_addr => {
+                let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
+                if let Some(signal) = PunchSignal::parse(reply) {
+                    if signal.verify(server_passcode) {
+                        if let PunchSignal::Passive { client_addr, .. } = signal {
+                            break client_addr;
                         }
+                    } else {
+                        warn!("Received unauthenticated PUNCH packet from Rendezvous Server, dropping.");
                     }
                 }
             }
             Err(ref e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
-                // Timeout, send keep-alive
+                // Timeout, send authenticated keep-alive
                 let _ = send_server_keepalive(
                     &socket,
                     rendezvous_addr,
@@ -381,10 +301,11 @@ pub fn run_server_p2p_handshake(
                 eprintln!("[P2P Server ERROR] Socket error while waiting for connection: {}. Giving up.", e);
                 return Err(e.into());
             }
+            _ => {}
         }
     };
 
-    // 3. Hole Punching Phase using server_passcode
+    // 3. Hole Punching Phase with client
     info!(
         "[P2P Server] Received authenticated connection request from {}. Starting UDP hole punching...",
         peer_addr
@@ -417,6 +338,7 @@ pub fn run_server_p2p_handshake(
     Ok(socket)
 }
 
+/// Orchestrates P2P connection request and handshake for a `tcp-to-quic` client.
 pub fn run_client_p2p_handshake(
     rendezvous_addr: SocketAddr,
     server_passcode: &str,
@@ -453,37 +375,26 @@ pub fn run_client_p2p_handshake(
         socket.set_read_timeout(Some(Duration::from_secs(2)))?;
 
         let mut buf = [0; 1024];
-
-        // Send CONN to Rendezvous Server with target_tcp_port and server_passcode HMAC
         let mut peer_addr = None;
         let mut target_name = String::new();
         let mut last_err = String::new();
 
         for _ in 0..5 {
-            let seq = next_seq();
-            let payload = format!("CONN:{}:{}", target_tcp_port, seq);
-            let hmac = compute_auth(server_passcode, &payload);
-            let conn_msg = format!("CONN {} {} {}", target_tcp_port, seq, hmac);
-
+            let conn_msg = ClientConn::new_signed(target_tcp_port, server_passcode);
             socket.send_to(conn_msg.as_bytes(), rendezvous_addr)?;
+
             match socket.recv_from(&mut buf) {
                 Ok((len, src)) if src == rendezvous_addr => {
-                    let reply = std::str::from_utf8(&buf[..len]).unwrap_or("");
-                    let parts: Vec<&str> = reply.split_whitespace().collect();
-                    if parts.len() >= 6 && parts[0] == "PUNCH" {
-                        let peer_addr_str = parts[1];
-                        let role = parts[2];
-                        let srv_name = parts[3];
-                        let resp_seq = parts[4];
-                        let resp_hmac = parts[5];
-                        let expected_payload = format!("PUNCH:{}:{}:{}:{}", peer_addr_str, role, srv_name, resp_seq);
-                        if verify_auth(server_passcode, &expected_payload, resp_hmac) && role == "active" {
-                            let addr: SocketAddr = peer_addr_str.parse()?;
-                            peer_addr = Some(addr);
-                            target_name = srv_name.to_string();
-                            break;
+                    let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
+                    if let Some(signal) = PunchSignal::parse(reply) {
+                        if signal.verify(server_passcode) {
+                            if let PunchSignal::Active { server_addr, server_name, .. } = signal {
+                                peer_addr = Some(server_addr);
+                                target_name = server_name;
+                                break;
+                            }
                         }
-                    } else if parts.len() >= 2 && parts[0] == "ERR" {
+                    } else if reply.starts_with("ERR") {
                         last_err = reply.to_string();
                         warn!("[P2P Client] Rendezvous Server rejected connection: {}", reply);
                         println!("[P2P Client] Rendezvous Server rejected connection: {}", reply);
@@ -584,6 +495,7 @@ pub fn run_client_p2p_handshake(
     Err("P2P client handshake failed after retries".into())
 }
 
+/// Sends a periodic authenticated registration keep-alive packet to `rendezvous-server`.
 pub fn send_server_keepalive(
     socket: &UdpSocket,
     rendezvous_addr: SocketAddr,
@@ -593,14 +505,12 @@ pub fn send_server_keepalive(
     server_passcode: &str,
     rendezvous_passcode: &str,
 ) -> io::Result<()> {
-    let seq = next_seq();
-    let payload = format!("REG:{}:{}:{}:{}:{}", name, tcp_port, status, server_passcode, seq);
-    let hmac = compute_auth(rendezvous_passcode, &payload);
-    let reg_msg = format!("REG {} {} {} {} {} {}", name, tcp_port, status, server_passcode, seq, hmac);
+    let reg_msg = ServerReg::new_signed(name, tcp_port, status, server_passcode, rendezvous_passcode);
     socket.send_to(reg_msg.as_bytes(), rendezvous_addr)?;
     Ok(())
 }
 
+/// Sends an authenticated status transition (IDLE / BUSY) update to `rendezvous-server`.
 pub fn send_server_status(
     socket: &UdpSocket,
     rendezvous_addr: SocketAddr,
@@ -608,14 +518,12 @@ pub fn send_server_status(
     status: &str,
     rendezvous_passcode: &str,
 ) -> io::Result<()> {
-    let seq = next_seq();
-    let payload = format!("STATUS:{}:{}:{}", name, status, seq);
-    let hmac = compute_auth(rendezvous_passcode, &payload);
-    let status_msg = format!("STATUS {} {} {} {}", name, status, seq, hmac);
+    let status_msg = ServerStatusMsg::new_signed(name, status, rendezvous_passcode);
     socket.send_to(status_msg.as_bytes(), rendezvous_addr)?;
     Ok(())
 }
 
+/// Re-negotiates UDP hole punching after an existing connection has been dropped or reset.
 pub fn reconnect_client_p2p_handshake(
     socket: &UdpSocket,
     rendezvous_addr: SocketAddr,
@@ -640,29 +548,20 @@ pub fn reconnect_client_p2p_handshake(
         let mut last_err = String::new();
 
         for _ in 0..5 {
-            let seq = next_seq();
-            let payload = format!("RESET:{}:{}", target_tcp_port, seq);
-            let hmac = compute_auth(server_passcode, &payload);
-            let reset_msg = format!("RESET {} {} {}", target_tcp_port, seq, hmac);
-
+            let reset_msg = ClientReset::new_signed(target_tcp_port, server_passcode);
             socket.send_to(reset_msg.as_bytes(), rendezvous_addr)?;
+
             match socket.recv_from(&mut buf) {
                 Ok((len, src)) if src == rendezvous_addr => {
-                    let reply = std::str::from_utf8(&buf[..len]).unwrap_or("");
-                    let parts: Vec<&str> = reply.split_whitespace().collect();
-                    if parts.len() >= 6 && parts[0] == "PUNCH" {
-                        let peer_addr_str = parts[1];
-                        let role = parts[2];
-                        let srv_name = parts[3];
-                        let resp_seq = parts[4];
-                        let resp_hmac = parts[5];
-                        let expected_payload = format!("PUNCH:{}:{}:{}:{}", peer_addr_str, role, srv_name, resp_seq);
-                        if verify_auth(server_passcode, &expected_payload, resp_hmac) && role == "active" {
-                            let addr: SocketAddr = peer_addr_str.parse()?;
-                            peer_addr = Some(addr);
-                            break;
+                    let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
+                    if let Some(signal) = PunchSignal::parse(reply) {
+                        if signal.verify(server_passcode) {
+                            if let PunchSignal::Active { server_addr, .. } = signal {
+                                peer_addr = Some(server_addr);
+                                break;
+                            }
                         }
-                    } else if parts.len() >= 2 && parts[0] == "ERR" {
+                    } else if reply.starts_with("ERR") {
                         last_err = reply.to_string();
                         warn!("[P2P Reconnect] Reset request rejected: {}", reply);
                         if reply.contains("Authentication failed") || reply.contains("No server registered") {
@@ -762,6 +661,7 @@ pub fn reconnect_client_p2p_handshake(
     Err("P2P client reconnect failed after retries".into())
 }
 
+/// Handles a reconnect punch request on the server side.
 pub fn server_handle_reconnect_punch(
     socket: &UdpSocket,
     client_addr: SocketAddr,
@@ -815,47 +715,4 @@ pub fn server_handle_reconnect_punch(
 
     socket.set_read_timeout(None)?;
     Ok(final_peer_addr)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_auth_computation_and_verification() {
-        let passcode = "super_secret";
-        let payload = "REG:srv1:8080:IDLE:pass1:123456";
-        let hmac = compute_auth(passcode, payload);
-        assert!(!hmac.is_empty());
-        assert!(verify_auth(passcode, payload, &hmac));
-        assert!(!verify_auth("wrong_passcode", payload, &hmac));
-        assert!(!verify_auth(passcode, "different_payload", &hmac));
-    }
-
-    #[test]
-    fn test_replay_filter_detection() {
-        let mut filter = ReplayFilter::new();
-        let seq1 = next_seq();
-        let seq2 = next_seq();
-
-        // First presentation of sequences succeeds
-        assert!(filter.check_and_add(seq1));
-        assert!(filter.check_and_add(seq2));
-
-        // Replay of same sequence must be rejected
-        assert!(!filter.check_and_add(seq1));
-        assert!(!filter.check_and_add(seq2));
-
-        // Ancient sequence (more than 120s ago) must be rejected
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let ancient_seq = ((now_ms - 200_000) << 10) | 1;
-        assert!(!filter.check_and_add(ancient_seq));
-
-        // Future sequence (> 120s in future) must be rejected
-        let future_seq = ((now_ms + 200_000) << 10) | 1;
-        assert!(!filter.check_and_add(future_seq));
-    }
 }
