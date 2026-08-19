@@ -3,7 +3,7 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-pub use crate::auth::{compute_auth, next_seq, verify_auth, ReplayFilter};
+pub use crate::auth::{compute_auth, derive_tunnel_id, next_seq, verify_auth, ReplayFilter};
 use crate::protocol::{
     ClientConn, ClientReset, PeerProbe, PunchSignal, RegOk, ServerReg, ServerStatusMsg,
 };
@@ -105,7 +105,7 @@ pub fn perform_hole_punching(
                                     info!(
                                         "[P2P Hole Punch] [Progress: Round {}/{}] STEP 2/3: Received PEER_PUNCH_ACK from {}. Bidirectional NAT mapping confirmed! Replying with PEER_PUNCH_ACK_ACK.",
                                         round, max_rounds, src
-                                    );
+                                        );
                                     println!(
                                         "[P2P Hole Punch] [Progress: Round {}/{}] STEP 2/3: Received PEER_PUNCH_ACK from {}. Bidirectional NAT mapping confirmed! Replying with PEER_PUNCH_ACK_ACK.",
                                         round, max_rounds, src
@@ -210,11 +210,10 @@ pub fn perform_hole_punching(
 /// Orchestrates P2P registration and handshake for a `quic-to-tcp` server.
 pub fn run_server_p2p_handshake(
     rendezvous_addr: SocketAddr,
-    name: &str,
-    rendezvous_passcode: &str,
-    server_passcode: &str,
+    tunnel_code: &str,
     tcp_port: u16,
-) -> Result<UdpSocket, Box<dyn std::error::Error>> {
+) -> Result<(UdpSocket, String), Box<dyn std::error::Error>> {
+    let tunnel_id = derive_tunnel_id(tunnel_code);
     let bind_addr = match rendezvous_addr {
         SocketAddr::V4(_) => "0.0.0.0:0",
         SocketAddr::V6(_) => "[::]:0",
@@ -224,21 +223,21 @@ pub fn run_server_p2p_handshake(
 
     let mut buf = [0; 1024];
 
-    // 1. Register with Rendezvous Server using rendezvous_passcode
+    // 1. Register with Rendezvous Server using tunnel_code
     println!(
-        "Registering at Rendezvous Server {} as '{}' (TCP Port: {}, Status: IDLE)...",
-        rendezvous_addr, name, tcp_port
+        "Registering at Rendezvous Server {} (Tunnel ID: {}, Target Port: {}, Status: IDLE)...",
+        rendezvous_addr, tunnel_id, tcp_port
     );
     let mut reg_ok = false;
     for _ in 0..5 {
-        let reg_msg = ServerReg::new_signed(name, tcp_port, "IDLE", server_passcode, rendezvous_passcode);
+        let reg_msg = ServerReg::new_signed(&tunnel_id, tcp_port, "IDLE", tunnel_code);
         socket.send_to(reg_msg.as_bytes(), rendezvous_addr)?;
 
         match socket.recv_from(&mut buf) {
             Ok((len, src)) if src == rendezvous_addr => {
                 let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                 if let Some(ok) = RegOk::parse(reply) {
-                    if ok.verify(rendezvous_passcode) {
+                    if ok.verify(tunnel_code) {
                         reg_ok = true;
                         break;
                     } else {
@@ -254,14 +253,14 @@ pub fn run_server_p2p_handshake(
 
     if !reg_ok {
         error!(
-            "[P2P Server ERROR] Failed to register at Rendezvous Server {} (timeout or invalid rendezvous passcode). Giving up.",
+            "[P2P Server ERROR] Failed to register at Rendezvous Server {} (timeout or rejected). Giving up.",
             rendezvous_addr
         );
         eprintln!(
-            "[P2P Server ERROR] Failed to register at Rendezvous Server {} (timeout or invalid rendezvous passcode). Giving up.",
+            "[P2P Server ERROR] Failed to register at Rendezvous Server {} (timeout or rejected). Giving up.",
             rendezvous_addr
         );
-        return Err("Failed to register at Rendezvous Server: timeout or invalid rendezvous passcode".into());
+        return Err("Failed to register at Rendezvous Server: timeout or rejected".into());
     }
     println!("Registration successful at Rendezvous Server.");
 
@@ -273,7 +272,7 @@ pub fn run_server_p2p_handshake(
             Ok((len, src)) if src == rendezvous_addr => {
                 let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                 if let Some(signal) = PunchSignal::parse(reply) {
-                    if signal.verify(server_passcode) {
+                    if signal.verify(tunnel_code) {
                         if let PunchSignal::Passive { client_addr, .. } = signal {
                             break client_addr;
                         }
@@ -289,11 +288,10 @@ pub fn run_server_p2p_handshake(
                 let _ = send_server_keepalive(
                     &socket,
                     rendezvous_addr,
-                    name,
+                    &tunnel_id,
                     tcp_port,
                     "IDLE",
-                    server_passcode,
-                    rendezvous_passcode,
+                    tunnel_code,
                 );
             }
             Err(e) => {
@@ -310,7 +308,7 @@ pub fn run_server_p2p_handshake(
         "[P2P Server] Received authenticated connection request from {}. Starting UDP hole punching...",
         peer_addr
     );
-    let final_peer_addr = match perform_hole_punching(&socket, peer_addr, server_passcode) {
+    let final_peer_addr = match perform_hole_punching(&socket, peer_addr, tunnel_code) {
         Ok(addr) => addr,
         Err(e) => {
             error!(
@@ -335,25 +333,25 @@ pub fn run_server_p2p_handshake(
     );
 
     socket.set_read_timeout(None)?;
-    Ok(socket)
+    Ok((socket, tunnel_id))
 }
 
 /// Orchestrates P2P connection request and handshake for a `tcp-to-quic` client.
 pub fn run_client_p2p_handshake(
     rendezvous_addr: SocketAddr,
-    server_passcode: &str,
-    target_tcp_port: u16,
+    tunnel_code: &str,
 ) -> Result<(UdpSocket, SocketAddr, String), Box<dyn std::error::Error>> {
+    let tunnel_id = derive_tunnel_id(tunnel_code);
     let max_handshake_attempts = 3;
 
     for attempt in 1..=max_handshake_attempts {
         info!(
-            "[P2P Client] Handshake attempt {}/{}: Connecting to Rendezvous Server {} for target TCP port {}...",
-            attempt, max_handshake_attempts, rendezvous_addr, target_tcp_port
+            "[P2P Client] Handshake attempt {}/{}: Connecting to Rendezvous Server {} for Tunnel ID {}...",
+            attempt, max_handshake_attempts, rendezvous_addr, tunnel_id
         );
         println!(
-            "[P2P Client] Handshake attempt {}/{}: Connecting to Rendezvous Server {} for target TCP port {}...",
-            attempt, max_handshake_attempts, rendezvous_addr, target_tcp_port
+            "[P2P Client] Handshake attempt {}/{}: Connecting to Rendezvous Server {} for Tunnel ID {}...",
+            attempt, max_handshake_attempts, rendezvous_addr, tunnel_id
         );
 
         let bind_addr = match rendezvous_addr {
@@ -376,21 +374,19 @@ pub fn run_client_p2p_handshake(
 
         let mut buf = [0; 1024];
         let mut peer_addr = None;
-        let mut target_name = String::new();
         let mut last_err = String::new();
 
         for _ in 0..5 {
-            let conn_msg = ClientConn::new_signed(target_tcp_port, server_passcode);
+            let conn_msg = ClientConn::new_signed(&tunnel_id, tunnel_code);
             socket.send_to(conn_msg.as_bytes(), rendezvous_addr)?;
 
             match socket.recv_from(&mut buf) {
                 Ok((len, src)) if src == rendezvous_addr => {
                     let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                     if let Some(signal) = PunchSignal::parse(reply) {
-                        if signal.verify(server_passcode) {
-                            if let PunchSignal::Active { server_addr, server_name, .. } = signal {
+                        if signal.verify(tunnel_code) {
+                            if let PunchSignal::Active { server_addr, .. } = signal {
                                 peer_addr = Some(server_addr);
-                                target_name = server_name;
                                 break;
                             }
                         }
@@ -441,10 +437,10 @@ pub fn run_client_p2p_handshake(
             }
         };
 
-        // Hole Punching Phase with server_passcode
+        // Hole Punching Phase with tunnel_code
         info!("[P2P Client] Starting UDP hole punching to server endpoint {}...", peer_addr);
         println!("[P2P Client] Starting UDP hole punching to server endpoint {}...", peer_addr);
-        match perform_hole_punching(&socket, peer_addr, server_passcode) {
+        match perform_hole_punching(&socket, peer_addr, tunnel_code) {
             Ok(final_peer_addr) => {
                 info!(
                     "[P2P Client] UDP hole punching succeeded with peer {}",
@@ -455,7 +451,7 @@ pub fn run_client_p2p_handshake(
                     final_peer_addr
                 );
                 socket.set_read_timeout(None)?;
-                return Ok((socket, final_peer_addr, target_name));
+                return Ok((socket, final_peer_addr, tunnel_id));
             }
             Err(e) => {
                 if attempt < max_handshake_attempts {
@@ -485,12 +481,12 @@ pub fn run_client_p2p_handshake(
     }
 
     error!(
-        "[P2P Client ERROR] P2P handshake failed for target TCP port {} after {} attempts. Giving up.",
-        target_tcp_port, max_handshake_attempts
+        "[P2P Client ERROR] P2P handshake failed for Tunnel ID {} after {} attempts. Giving up.",
+        tunnel_id, max_handshake_attempts
     );
     eprintln!(
-        "[P2P Client ERROR] P2P handshake failed for target TCP port {} after {} attempts. Giving up.",
-        target_tcp_port, max_handshake_attempts
+        "[P2P Client ERROR] P2P handshake failed for Tunnel ID {} after {} attempts. Giving up.",
+        tunnel_id, max_handshake_attempts
     );
     Err("P2P client handshake failed after retries".into())
 }
@@ -499,13 +495,12 @@ pub fn run_client_p2p_handshake(
 pub fn send_server_keepalive(
     socket: &UdpSocket,
     rendezvous_addr: SocketAddr,
-    name: &str,
+    tunnel_id: &str,
     tcp_port: u16,
     status: &str,
-    server_passcode: &str,
-    rendezvous_passcode: &str,
+    tunnel_code: &str,
 ) -> io::Result<()> {
-    let reg_msg = ServerReg::new_signed(name, tcp_port, status, server_passcode, rendezvous_passcode);
+    let reg_msg = ServerReg::new_signed(tunnel_id, tcp_port, status, tunnel_code);
     socket.send_to(reg_msg.as_bytes(), rendezvous_addr)?;
     Ok(())
 }
@@ -514,11 +509,11 @@ pub fn send_server_keepalive(
 pub fn send_server_status(
     socket: &UdpSocket,
     rendezvous_addr: SocketAddr,
-    name: &str,
+    tunnel_id: &str,
     status: &str,
-    rendezvous_passcode: &str,
+    tunnel_code: &str,
 ) -> io::Result<()> {
-    let status_msg = ServerStatusMsg::new_signed(name, status, rendezvous_passcode);
+    let status_msg = ServerStatusMsg::new_signed(tunnel_id, status, tunnel_code);
     socket.send_to(status_msg.as_bytes(), rendezvous_addr)?;
     Ok(())
 }
@@ -527,19 +522,19 @@ pub fn send_server_status(
 pub fn reconnect_client_p2p_handshake(
     socket: &UdpSocket,
     rendezvous_addr: SocketAddr,
-    server_passcode: &str,
-    target_tcp_port: u16,
+    tunnel_code: &str,
 ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let tunnel_id = derive_tunnel_id(tunnel_code);
     let max_reconnect_attempts = 3;
 
     for attempt in 1..=max_reconnect_attempts {
         info!(
-            "[P2P Reconnect] Attempt {}/{}: Reporting unreachable socket to Rendezvous Server {} for TCP Port {}...",
-            attempt, max_reconnect_attempts, rendezvous_addr, target_tcp_port
+            "[P2P Reconnect] Attempt {}/{}: Reporting unreachable socket to Rendezvous Server {} for Tunnel ID {}...",
+            attempt, max_reconnect_attempts, rendezvous_addr, tunnel_id
         );
         println!(
-            "[P2P Reconnect] Attempt {}/{}: Reporting unreachable socket to Rendezvous Server {} for TCP Port {}...",
-            attempt, max_reconnect_attempts, rendezvous_addr, target_tcp_port
+            "[P2P Reconnect] Attempt {}/{}: Reporting unreachable socket to Rendezvous Server {} for Tunnel ID {}...",
+            attempt, max_reconnect_attempts, rendezvous_addr, tunnel_id
         );
 
         socket.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -548,14 +543,14 @@ pub fn reconnect_client_p2p_handshake(
         let mut last_err = String::new();
 
         for _ in 0..5 {
-            let reset_msg = ClientReset::new_signed(target_tcp_port, server_passcode);
+            let reset_msg = ClientReset::new_signed(&tunnel_id, tunnel_code);
             socket.send_to(reset_msg.as_bytes(), rendezvous_addr)?;
 
             match socket.recv_from(&mut buf) {
                 Ok((len, src)) if src == rendezvous_addr => {
                     let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                     if let Some(signal) = PunchSignal::parse(reply) {
-                        if signal.verify(server_passcode) {
+                        if signal.verify(tunnel_code) {
                             if let PunchSignal::Active { server_addr, .. } = signal {
                                 peer_addr = Some(server_addr);
                                 break;
@@ -610,7 +605,7 @@ pub fn reconnect_client_p2p_handshake(
             peer_addr
         );
 
-        match perform_hole_punching(socket, peer_addr, server_passcode) {
+        match perform_hole_punching(socket, peer_addr, tunnel_code) {
             Ok(final_peer_addr) => {
                 info!(
                     "[P2P Reconnect] UDP hole punching succeeded with peer {}",
@@ -637,12 +632,12 @@ pub fn reconnect_client_p2p_handshake(
                     continue;
                 } else {
                     error!(
-                        "[P2P Reconnect ERROR] Failed to restore UDP hole punch to server for TCP Port {} ({}) after {} attempts. Giving up.",
-                        target_tcp_port, peer_addr, max_reconnect_attempts
+                        "[P2P Reconnect ERROR] Failed to restore UDP hole punch to server ({}) after {} attempts. Giving up.",
+                        peer_addr, max_reconnect_attempts
                     );
                     eprintln!(
-                        "[P2P Reconnect ERROR] Failed to restore UDP hole punch to server for TCP Port {} ({}) after {} attempts. Giving up.",
-                        target_tcp_port, peer_addr, max_reconnect_attempts
+                        "[P2P Reconnect ERROR] Failed to restore UDP hole punch to server ({}) after {} attempts. Giving up.",
+                        peer_addr, max_reconnect_attempts
                     );
                     return Err(e);
                 }
@@ -651,12 +646,12 @@ pub fn reconnect_client_p2p_handshake(
     }
 
     error!(
-        "[P2P Reconnect ERROR] Reconnect failed for TCP Port {} after {} attempts. Giving up.",
-        target_tcp_port, max_reconnect_attempts
+        "[P2P Reconnect ERROR] Reconnect failed for Tunnel ID {} after {} attempts. Giving up.",
+        tunnel_id, max_reconnect_attempts
     );
     eprintln!(
-        "[P2P Reconnect ERROR] Reconnect failed for TCP Port {} after {} attempts. Giving up.",
-        target_tcp_port, max_reconnect_attempts
+        "[P2P Reconnect ERROR] Reconnect failed for Tunnel ID {} after {} attempts. Giving up.",
+        tunnel_id, max_reconnect_attempts
     );
     Err("P2P client reconnect failed after retries".into())
 }
@@ -666,10 +661,9 @@ pub fn server_handle_reconnect_punch(
     socket: &UdpSocket,
     client_addr: SocketAddr,
     rendezvous_addr: SocketAddr,
-    name: &str,
+    tunnel_id: &str,
     tcp_port: u16,
-    server_passcode: &str,
-    rendezvous_passcode: &str,
+    tunnel_code: &str,
 ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
     info!(
         "[P2P Server Reconnect] Received request for client {}. Starting UDP hole punching...",
@@ -679,7 +673,7 @@ pub fn server_handle_reconnect_punch(
         "[P2P Server Reconnect] Received request for client {}. Starting UDP hole punching...",
         client_addr
     );
-    let final_peer_addr = match perform_hole_punching(socket, client_addr, server_passcode) {
+    let final_peer_addr = match perform_hole_punching(socket, client_addr, tunnel_code) {
         Ok(addr) => addr,
         Err(e) => {
             error!(
@@ -706,11 +700,10 @@ pub fn server_handle_reconnect_punch(
     let _ = send_server_keepalive(
         socket,
         rendezvous_addr,
-        name,
+        tunnel_id,
         tcp_port,
         "BUSY",
-        server_passcode,
-        rendezvous_passcode,
+        tunnel_code,
     );
 
     socket.set_read_timeout(None)?;

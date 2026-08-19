@@ -21,6 +21,19 @@ pub fn next_token(current: &mut mio::Token) -> mio::Token {
     mio::Token(next)
 }
 
+pub fn optimize_udp_socket(socket: &std::net::UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
+}
+
+pub fn optimize_tcp_stream(stream: &mio::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_recv_buffer_size(2 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(2 * 1024 * 1024);
+}
+
 pub fn next_stream_id(current: &mut u64) -> u64 {
     const MAX_STREAM_ID: u64 = (1 << 62) - 1;
     if *current == 0 {

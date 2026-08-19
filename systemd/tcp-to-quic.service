@@ -1,0 +1,21 @@
+[Unit]
+Description=QUIC-TCP Client Proxy (tcp-to-quic)
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/etc/quic-tcp
+EnvironmentFile=-/etc/quic-tcp/tcp-to-quic.env
+ExecStart=/bin/sh -c 'exec /usr/local/bin/tcp-to-quic ${ARGS}'
+Restart=always
+RestartSec=3s
+LimitNOFILE=65536
+
+# Sandboxing & Security
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

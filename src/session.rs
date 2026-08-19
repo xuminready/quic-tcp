@@ -1,7 +1,4 @@
-use crate::{
-    MAX_DATAGRAM_SIZE,
-    utils::{interrupted, would_block},
-};
+use crate::utils::{interrupted, would_block};
 use log::{debug, error, warn};
 use mio::net::UdpSocket;
 use std::cmp::min;
@@ -28,7 +25,7 @@ pub fn is_disconnect_error(e: &io::Error) -> bool {
     )
 }
 
-pub const MAX_TCP_READ_PER_CALL: usize = 65536 * 4; // 256 KB max read per call
+pub const MAX_TCP_READ_PER_CALL: usize = 131072 * 16; // 2 MB max read per call
 
 pub struct PartialWrite {
     pub data: Vec<u8>,
@@ -189,44 +186,41 @@ impl Session {
             return FlushStatus::NoPending;
         };
 
-        let data_to_write = &pending.data[pending.written..];
-        let fin = pending.is_fin;
+        while pending.written < pending.data.len() {
+            let data_to_write = &pending.data[pending.written..];
+            let fin = pending.is_fin;
 
-        match self.conn.stream_send(stream_id, data_to_write, fin) {
-            Ok(written) => {
-                pending.written += written;
-                if pending.written == pending.data.len() {
-                    self.quic_partial_writes.remove(&stream_id);
-                    debug!("Fully flushed pending QUIC write for stream {}", stream_id);
-                    if fin {
-                        FlushStatus::FlushedAndClosed
-                    } else {
-                        FlushStatus::Flushed
-                    }
-                } else {
-                    debug!(
-                        "Partially flushed {} bytes to QUIC stream {}",
-                        written, stream_id
+            match self.conn.stream_send(stream_id, data_to_write, fin) {
+                Ok(0) => break,
+                Ok(written) => {
+                    pending.written += written;
+                }
+                Err(quiche::Error::Done) | Err(quiche::Error::StreamLimit) => {
+                    let _ = self.conn.stream_send(stream_id, &[], false);
+                    break;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to flush pending QUIC write for stream {}: {:?}",
+                        stream_id, e
                     );
-                    FlushStatus::Pending
+                    self.quic_partial_writes.remove(&stream_id);
+                    return FlushStatus::Flushed;
                 }
             }
-            Err(quiche::Error::Done) | Err(quiche::Error::StreamLimit) => {
-                debug!(
-                    "QUIC stream {} is blocked (Done or StreamLimit), sending 0-byte probe to elicit window update",
-                    stream_id
-                );
-                let _ = self.conn.stream_send(stream_id, &[], false);
-                FlushStatus::Pending
+        }
+
+        if pending.written == pending.data.len() {
+            let fin = pending.is_fin;
+            self.quic_partial_writes.remove(&stream_id);
+            debug!("Fully flushed pending QUIC write for stream {}", stream_id);
+            if fin {
+                FlushStatus::FlushedAndClosed
+            } else {
+                FlushStatus::Flushed
             }
-            Err(e) => {
-                error!(
-                    "Failed to flush pending QUIC write for stream {}: {:?}",
-                    stream_id, e
-                );
-                self.quic_partial_writes.remove(&stream_id);
-                FlushStatus::Flushed // Treat as flushed to stop retrying
-            }
+        } else {
+            FlushStatus::Pending
         }
     }
 
@@ -240,37 +234,36 @@ impl Session {
             return Ok(FlushStatus::NoPending);
         };
 
-        let data_to_write = &pending.data[pending.written..];
-        match tcp_stream.write(data_to_write) {
-            Ok(written) => {
-                pending.written += written;
-                if pending.written == pending.data.len() {
-                    let is_fin = pending.is_fin;
-                    self.tcp_partial_writes.remove(&stream_id);
-                    debug!("Fully flushed pending TCP write for stream {}", stream_id);
-                    if is_fin {
-                        Ok(FlushStatus::FlushedAndClosed)
-                    } else {
-                        Ok(FlushStatus::Flushed)
-                    }
-                } else {
-                    debug!(
-                        "Partially flushed {} bytes to TCP stream {}",
-                        written, stream_id
+        while pending.written < pending.data.len() {
+            let data_to_write = &pending.data[pending.written..];
+            match tcp_stream.write(data_to_write) {
+                Ok(0) => break,
+                Ok(written) => {
+                    pending.written += written;
+                }
+                Err(ref err) if would_block(err) || interrupted(err) => break,
+                Err(e) => {
+                    error!(
+                        "Failed to flush pending TCP write for stream {}: {:?}",
+                        stream_id, e
                     );
-                    Ok(FlushStatus::Pending)
+                    self.tcp_partial_writes.remove(&stream_id);
+                    return Err(e);
                 }
             }
-            Err(ref err) if would_block(err) => Ok(FlushStatus::Pending),
-            Err(ref err) if interrupted(err) => Ok(FlushStatus::Pending),
-            Err(e) => {
-                error!(
-                    "Failed to flush pending TCP write for stream {}: {:?}",
-                    stream_id, e
-                );
-                self.tcp_partial_writes.remove(&stream_id);
-                Err(e)
+        }
+
+        if pending.written == pending.data.len() {
+            let is_fin = pending.is_fin;
+            self.tcp_partial_writes.remove(&stream_id);
+            debug!("Fully flushed pending TCP write for stream {}", stream_id);
+            if is_fin {
+                Ok(FlushStatus::FlushedAndClosed)
+            } else {
+                Ok(FlushStatus::Flushed)
             }
+        } else {
+            Ok(FlushStatus::Pending)
         }
     }
 
@@ -312,7 +305,7 @@ impl Session {
             ));
         };
 
-        let mut buf = [0; MAX_DATAGRAM_SIZE];
+        let mut buf = [0u8; 131072];
         let mut is_eof = false;
         let mut bytes_read_this_call = 0;
 
@@ -335,8 +328,7 @@ impl Session {
                 }
             } else {
                 // Stream is not opened yet (Idle). We assume it has capacity to start.
-                // We use MAX_DATAGRAM_SIZE to read the first chunk and open the stream.
-                MAX_DATAGRAM_SIZE
+                131072
             };
 
             if capacity == 0 {
@@ -344,7 +336,7 @@ impl Session {
                 break 'read;
             }
 
-            let read_limit = min(capacity, MAX_DATAGRAM_SIZE);
+            let read_limit = min(capacity, buf.len());
             match tcp_stream.read(&mut buf[..read_limit]) {
                 Ok(0) => {
                     debug!("TCP stream {} reached EOF", stream_id);
@@ -651,7 +643,7 @@ pub fn flush_quic_to_udp(
     conn: &mut quiche::Connection,
     udp_socket: &UdpSocket,
 ) -> io::Result<bool> {
-    let mut out = [0; MAX_DATAGRAM_SIZE];
+    let mut out = [0u8; 65535];
     loop {
         let (write, send_info) = match conn.send(&mut out) {
             Ok(v) => v,

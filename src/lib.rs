@@ -6,12 +6,12 @@ pub mod session;
 pub mod token;
 pub mod utils;
 
-pub const MAX_DATAGRAM_SIZE: usize = 1350;
+pub const MAX_DATAGRAM_SIZE: usize = 1450;
 pub const TCP_TOKEN: mio::Token = mio::Token(0);
 pub const UDP_TOKEN: mio::Token = mio::Token(1);
 
 // Re-exports for convenience
-pub use auth::{compute_auth, next_seq, verify_auth, ReplayFilter};
+pub use auth::{compute_auth, derive_tunnel_id, next_seq, verify_auth, ReplayFilter};
 pub use config::get_quic_config;
 pub use p2p::{
     perform_hole_punching, reconnect_client_p2p_handshake, run_client_p2p_handshake,
@@ -23,4 +23,7 @@ pub use protocol::{
 };
 pub use session::{FlushStatus, PartialWrite, Session, flush_quic_to_udp};
 pub use token::{mint_token, validate_token};
-pub use utils::{hex_dump, interrupted, next_stream_id, next_token, would_block};
+pub use utils::{
+    hex_dump, interrupted, next_stream_id, next_token, optimize_tcp_stream, optimize_udp_socket,
+    would_block,
+};

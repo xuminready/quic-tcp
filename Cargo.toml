@@ -12,6 +12,7 @@ log = { version = "0.4.27", features = ["max_level_trace", "release_max_level_wa
 mio = { version = "1.0.3", features = ["net", "os-poll"] }
 quiche = "0.24.2"
 ring = "0.17.14"
+socket2 = "0.5"
 
 [[bin]]
 name = "tcp-to-quic"

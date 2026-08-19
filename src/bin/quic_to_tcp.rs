@@ -11,10 +11,9 @@ type ClientMap = HashMap<quiche::ConnectionId<'static>, Session>;
 
 struct P2pServerContext {
     rendezvous_addr: SocketAddr,
-    name: String,
+    tunnel_id: String,
     tcp_port: u16,
-    server_passcode: String,
-    rendezvous_passcode: String,
+    tunnel_code: String,
     std_socket_raw: std::net::UdpSocket,
     last_keepalive: Instant,
     status: String,
@@ -24,14 +23,12 @@ enum ServerMode {
     Direct {
         local_udp_addr: SocketAddr,
         remote_tcp_addr: SocketAddr,
-        server_passcode: String,
+        tunnel_code: String,
     },
     P2p {
         rendezvous_addr: SocketAddr,
-        name: String,
-        rendezvous_passcode: String,
-        server_passcode: String,
         remote_tcp_addr: SocketAddr,
+        tunnel_code: String,
     },
 }
 
@@ -42,41 +39,63 @@ impl ServerMode {
         }
 
         if args[1] == "p2p" {
-            if args.len() < 6 {
-                return Err("Missing required P2P arguments".to_string());
+            // Support simplified syntax: quic-to-tcp p2p <Rendezvous_IP:Port> <Remote_TCP_IP:Port> [Code]
+            // Also supports legacy syntax: quic-to-tcp p2p <Rendezvous_IP:Port> <Name> <Rdv_Pass> <Srv_Pass> <Remote_TCP_IP:Port>
+            if args.len() >= 6 && args[3].parse::<SocketAddr>().is_err() {
+                // Legacy syntax
+                let rendezvous_addr: SocketAddr = args[2]
+                    .parse()
+                    .map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
+                let remote_tcp_addr_str = if args.len() >= 7 { &args[6] } else { &args[5] };
+                let remote_tcp_addr: SocketAddr = remote_tcp_addr_str
+                    .parse()
+                    .map_err(|e| format!("Invalid TCP remote address: {}", e))?;
+                let tunnel_code = if args.len() >= 7 {
+                    args[5].clone()
+                } else {
+                    args[4].clone()
+                };
+                return Ok(ServerMode::P2p {
+                    rendezvous_addr,
+                    remote_tcp_addr,
+                    tunnel_code,
+                });
             }
+
+            if args.len() < 4 {
+                return Err("Missing required P2P arguments. Expected: p2p <Rendezvous_IP:Port> <Remote_TCP_IP:Port> [Code]".to_string());
+            }
+
             let rendezvous_addr: SocketAddr = args[2]
                 .parse()
                 .map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
-            let name = args[3].clone();
-            let (rendezvous_passcode, server_passcode, remote_tcp_addr_str) = if args.len() >= 7 {
-                (args[4].clone(), args[5].clone(), &args[6])
-            } else {
-                (args[4].clone(), args[4].clone(), &args[5])
-            };
-            let remote_tcp_addr: SocketAddr = remote_tcp_addr_str
+            let remote_tcp_addr: SocketAddr = args[3]
                 .parse()
                 .map_err(|e| format!("Invalid TCP remote address: {}", e))?;
+            let tunnel_code = if args.len() > 4 {
+                args[4].clone()
+            } else {
+                "secret123".to_string()
+            };
 
             Ok(ServerMode::P2p {
                 rendezvous_addr,
-                name,
-                rendezvous_passcode,
-                server_passcode,
                 remote_tcp_addr,
+                tunnel_code,
             })
         } else {
-            if args.len() < 3 {
-                return Err("Missing required Direct Mode arguments".to_string());
+            let offset = if args[1] == "direct" { 1 } else { 0 };
+            if args.len() < 3 + offset {
+                return Err("Missing required Direct Mode arguments. Expected: [direct] <Local_UDP_IP:Port> <Remote_TCP_IP:Port> [Code]".to_string());
             }
-            let local_udp_addr: SocketAddr = args[1]
+            let local_udp_addr: SocketAddr = args[1 + offset]
                 .parse()
                 .map_err(|e| format!("Invalid UDP local address: {}", e))?;
-            let remote_tcp_addr: SocketAddr = args[2]
+            let remote_tcp_addr: SocketAddr = args[2 + offset]
                 .parse()
                 .map_err(|e| format!("Invalid TCP remote address: {}", e))?;
-            let server_passcode = if args.len() > 3 {
-                args[3].clone()
+            let tunnel_code = if args.len() > 3 + offset {
+                args[3 + offset].clone()
             } else {
                 "secret123".to_string()
             };
@@ -84,7 +103,7 @@ impl ServerMode {
             Ok(ServerMode::Direct {
                 local_udp_addr,
                 remote_tcp_addr,
-                server_passcode,
+                tunnel_code,
             })
         }
     }
@@ -106,45 +125,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events = mio::Events::with_capacity(1024);
 
     let mut p2p_ctx: Option<P2pServerContext> = None;
-    let server_passcode: String;
+    let tunnel_code: String;
 
     let (mut udp_socket, tcp_remote_addr) = match mode {
         ServerMode::P2p {
             rendezvous_addr,
-            name,
-            rendezvous_passcode,
-            server_passcode: srv_pass,
             remote_tcp_addr,
+            tunnel_code: code,
         } => {
-            server_passcode = srv_pass.clone();
+            tunnel_code = code.clone();
             let tcp_port = remote_tcp_addr.port();
 
-            println!(
-                "P2P Mode: registering at Rendezvous Server {} as '{}' (TCP Port: {})",
-                rendezvous_addr, name, tcp_port
-            );
-            println!("TCP Remote Server: {}", remote_tcp_addr);
-
-            let std_socket = run_server_p2p_handshake(
+            let (std_socket, tunnel_id) = run_server_p2p_handshake(
                 rendezvous_addr,
-                &name,
-                &rendezvous_passcode,
-                &server_passcode,
+                &tunnel_code,
                 tcp_port,
             )?;
             info!("UDP hole punching succeeded on server side!");
-            println!("UDP hole punching succeeded on server side!");
+
+            println!("======================================================================");
+            println!("[+] Tunnel ID:       {}", tunnel_id);
+            println!("[+] Forwarding To:   {}", remote_tcp_addr);
+            println!("[+] Rendezvous:      {}", rendezvous_addr);
+            println!("[+] Secret Code:     {}", tunnel_code);
+            println!("[+] Connect with:    tcp-to-quic p2p {} 127.0.0.1:<LOCAL_PORT> {}", rendezvous_addr, tunnel_code);
+            println!("======================================================================");
 
             let std_socket_raw = std_socket.try_clone()?;
+            optimize_udp_socket(&std_socket_raw);
             std_socket.set_nonblocking(true)?;
             let udp_socket = mio::net::UdpSocket::from_std(std_socket);
 
             p2p_ctx = Some(P2pServerContext {
                 rendezvous_addr,
-                name,
+                tunnel_id,
                 tcp_port,
-                server_passcode: server_passcode.clone(),
-                rendezvous_passcode,
+                tunnel_code: tunnel_code.clone(),
                 std_socket_raw,
                 last_keepalive: Instant::now(),
                 status: "IDLE".to_string(),
@@ -155,13 +171,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ServerMode::Direct {
             local_udp_addr,
             remote_tcp_addr,
-            server_passcode: srv_pass,
+            tunnel_code: code,
         } => {
-            server_passcode = srv_pass;
+            tunnel_code = code;
             println!("Direct Mode: listening on UDP {}", local_udp_addr);
             println!("TCP Remote Server: {}", remote_tcp_addr);
+            println!("Secret Code: {}", tunnel_code);
 
-            let udp_socket = mio::net::UdpSocket::bind(local_udp_addr).unwrap();
+            let std_sock = std::net::UdpSocket::bind(local_udp_addr).unwrap();
+            optimize_udp_socket(&std_sock);
+            std_sock.set_nonblocking(true)?;
+            let udp_socket = mio::net::UdpSocket::from_std(std_sock);
             (udp_socket, remote_tcp_addr)
         }
     };
@@ -215,11 +235,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = send_server_keepalive(
                     &info.std_socket_raw,
                     info.rendezvous_addr,
-                    &info.name,
+                    &info.tunnel_id,
                     info.tcp_port,
                     &info.status,
-                    &info.server_passcode,
-                    &info.rendezvous_passcode,
+                    &info.tunnel_code,
                 );
                 info.last_keepalive = Instant::now();
             }
@@ -265,6 +284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
         }
 
         for event in events.iter() {
@@ -288,7 +308,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if from == info.rendezvous_addr {
                                 let text = std::str::from_utf8(pkt_buf).unwrap_or("").trim();
                                 if let Some(signal) = PunchSignal::parse(text) {
-                                    if signal.verify(&info.server_passcode) {
+                                    if signal.verify(&info.tunnel_code) {
                                         if let PunchSignal::Passive { client_addr, .. } = signal {
                                             warn!(
                                                 "[P2P Server Reconnect] Received authenticated PUNCH request from client {}. Resetting sessions and starting hole punching...",
@@ -310,10 +330,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 &info.std_socket_raw,
                                                 client_addr,
                                                 info.rendezvous_addr,
-                                                &info.name,
+                                                &info.tunnel_id,
                                                 info.tcp_port,
-                                                &info.server_passcode,
-                                                &info.rendezvous_passcode,
+                                                &info.tunnel_code,
                                             );
 
                                             info.std_socket_raw.set_nonblocking(true).ok();
@@ -425,24 +444,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let _ = send_server_status(
                                             &info.std_socket_raw,
                                             info.rendezvous_addr,
-                                            &info.name,
+                                            &info.tunnel_id,
                                             "BUSY",
-                                            &info.rendezvous_passcode,
+                                            &info.tunnel_code,
                                         );
                                         info!("[P2P Server] Server status transitioned to BUSY.");
                                     }
                                 }
                             }
                         }
+                    }
 
-                        // Process readable streams (Stream 0 auth or TCP proxy streams)
+                    // Process readable and writable streams for all active sessions after draining UDP
+                    for session in sessions.values_mut() {
                         if session.conn.is_in_early_data() || session.conn.is_established() {
                             for stream_id in session.conn.readable() {
                                 if stream_id == 0 {
-                                    match session.process_server_auth(&server_passcode, &mut peer_auth_filter) {
+                                    match session.process_server_auth(&tunnel_code, &mut peer_auth_filter) {
                                         Ok(true) => {
-                                            info!("[Auth OK] Direct/P2P client authenticated successfully with valid server passcode!");
-                                            println!("[Auth OK] Direct/P2P client authenticated successfully with valid server passcode!");
+                                            info!("[Auth OK] Direct/P2P client authenticated successfully with valid secret code!");
+                                            println!("[Auth OK] Direct/P2P client authenticated successfully with valid secret code!");
                                         }
                                         Ok(false) => {}
                                         Err(e) => {
@@ -471,6 +492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             continue;
                                         }
                                     };
+                                    optimize_tcp_stream(&tcp_stream);
                                     poll.registry()
                                         .register(
                                             &mut tcp_stream,
@@ -491,6 +513,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     session.close_tcp_stream_by_id(stream_id, &mut poll);
                                     token_scid_map.retain(|tok, _| session.token_to_stream_id.contains_key(tok));
+                                }
+                            }
+
+                            for stream_id in session.conn.writable() {
+                                session.flush_pending_quic_write(stream_id);
+                                if session.tcp_streams.contains_key(&stream_id) {
+                                    if let Err(e) = session.forward_tcp_to_quic(stream_id, &mut poll) {
+                                        if !quic_tcp::session::is_disconnect_error(&e) {
+                                            warn!("forward_tcp_to_quic error for stream {}: {:?}", stream_id, e);
+                                        }
+                                        session.close_tcp_stream_by_id(stream_id, &mut poll);
+                                    }
                                 }
                             }
                         }
@@ -519,6 +553,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tcp_closed = true;
                             }
                         }
+                        let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
                     }
 
                     if event.is_readable() && !tcp_closed {
@@ -531,6 +566,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tcp_closed = true;
                             }
                         }
+                        let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
                     }
 
                     if tcp_closed {
@@ -584,9 +620,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = send_server_status(
                     &info.std_socket_raw,
                     info.rendezvous_addr,
-                    &info.name,
+                    &info.tunnel_id,
                     "IDLE",
-                    &info.rendezvous_passcode,
+                    &info.tunnel_code,
                 );
                 info!("[P2P Server] All client sessions disconnected. Transitioned server status back to IDLE.");
             }
@@ -596,10 +632,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn print_usage(bin_name: &str) {
     eprintln!("Usage (Direct Mode):");
-    eprintln!("  {} <Local_UDP_IP:Port> <Remote_TCP_IP:Port> [Server_Passcode]", bin_name);
+    eprintln!("  {} [direct] <Local_UDP_IP:Port> <Remote_TCP_IP:Port> [Secret_Code]", bin_name);
+    eprintln!("  Example: {} 127.0.0.1:4433 127.0.0.1:8080 my_secret", bin_name);
+    eprintln!();
     eprintln!("Usage (P2P Mode):");
     eprintln!(
-        "  {} p2p <Rendezvous_Server_IP:Port> <Name> <Rendezvous_Passcode> <Server_Passcode> <Remote_TCP_IP:Port>",
+        "  {} p2p <Rendezvous_Server_IP:Port> <Remote_TCP_IP:Port> [Secret_Code]",
         bin_name
     );
+    eprintln!("  Example: {} p2p 1.2.3.4:5050 127.0.0.1:8080 my_secret", bin_name);
 }

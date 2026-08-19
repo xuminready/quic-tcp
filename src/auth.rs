@@ -90,6 +90,12 @@ impl Default for ReplayFilter {
     }
 }
 
+/// Derives a deterministic, 16-character hex tunnel ID from a passcode/secret.
+pub fn derive_tunnel_id(passcode: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, passcode.as_bytes());
+    hex_dump(&digest.as_ref()[..8])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,12 +103,22 @@ mod tests {
     #[test]
     fn test_auth_computation_and_verification() {
         let passcode = "super_secret";
-        let payload = "REG:srv1:8080:IDLE:pass1:123456";
+        let payload = "REG:4f8a12bc34de5678:8080:IDLE:123456";
         let hmac = compute_auth(passcode, payload);
         assert!(!hmac.is_empty());
         assert!(verify_auth(passcode, payload, &hmac));
         assert!(!verify_auth("wrong_passcode", payload, &hmac));
         assert!(!verify_auth(passcode, "different_payload", &hmac));
+    }
+
+    #[test]
+    fn test_derive_tunnel_id() {
+        let id1 = derive_tunnel_id("my_secret_code");
+        let id2 = derive_tunnel_id("my_secret_code");
+        let id3 = derive_tunnel_id("other_secret");
+        assert_eq!(id1, id2);
+        assert_eq!(id1.len(), 16);
+        assert_ne!(id1, id3);
     }
 
     #[test]
