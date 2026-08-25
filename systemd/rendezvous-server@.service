@@ -1,13 +1,13 @@
 [Unit]
-Description=QUIC-TCP Server Proxy (quic-to-tcp)
+Description=QUIC-TCP Rendezvous Server (Instance: %i)
 After=network.target network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/etc/quic-tcp
-EnvironmentFile=-/etc/quic-tcp/quic-to-tcp.env
-ExecStart=/bin/sh -c 'exec /usr/local/bin/quic-to-tcp ${ARGS}'
+EnvironmentFile=-/etc/quic-tcp/rendezvous-server-%i.env
+EnvironmentFile=-/etc/quic-tcp/rendezvous-server.env
+ExecStart=/usr/local/bin/rendezvous-server ${PORT}
 Restart=always
 RestartSec=3s
 LimitNOFILE=65536

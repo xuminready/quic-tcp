@@ -112,41 +112,55 @@ cargo build --release
 
 ## Linux Installation & Systemd Services
 
-An interactive installer script (`install.sh`) is provided to install binaries to `/usr/local/bin`, generate TLS certificates, and configure auto-starting systemd services with user-prompted parameters.
+An interactive installer script (`install.sh`) is provided to install binaries to `/usr/local/bin`, generate TLS certificates, and configure auto-starting systemd services with support for **multiple concurrent instances on different ports**.
 
 ### 1. Run Interactive Installer
 ```bash
-sudo ./install.sh
+./install.sh
 ```
+*(Builds locally as your standard user and only requests `sudo` when writing to system directories).*
+
 The script will prompt you:
-1. Which service(s) to configure (`rendezvous-server`, `quic-to-tcp`, or `tcp-to-quic`).
+1. Which service to configure (`rendezvous-server`, `quic-to-tcp`, or `tcp-to-quic`).
 2. Operating Mode (`P2P` or `Direct`).
 3. Parameters (Rendezvous IP, Local/Remote TCP ports, and Secret Passcode).
+4. **Instance Identifier** (Defaults to the port number, e.g. `quic-to-tcp@8080.service`, `tcp-to-quic@7070.service`, or `rendezvous-server@5050.service`).
 
-It automatically generates `/etc/quic-tcp/` configs, creates TLS certificates, and enables the systemd service(s).
+You can run `./install.sh` multiple times to spawn separate tunnels for multiple local/remote ports!
 
-### 2. Service Management
+### 2. List Configured & Running Services
+To inspect all active/configured QUIC-TCP service instances and their listening/forwarding parameters:
 ```bash
-# Check service status
-sudo systemctl status quic-to-tcp
-sudo systemctl status tcp-to-quic
-sudo systemctl status rendezvous-server
+./install.sh list
+# or
+./uninstall.sh list
+```
+
+### 3. Service Management
+```bash
+# Check instance status
+sudo systemctl status quic-to-tcp@8080
+sudo systemctl status tcp-to-quic@7070
+sudo systemctl status rendezvous-server@5050
 
 # View live system logs
-sudo journalctl -u quic-to-tcp -f
-sudo journalctl -u tcp-to-quic -f
-sudo journalctl -u rendezvous-server -f
+sudo journalctl -u quic-to-tcp@8080 -f
+sudo journalctl -u tcp-to-quic@7070 -f
+sudo journalctl -u rendezvous-server@5050 -f
 
-# Restart or stop
-sudo systemctl restart quic-to-tcp
-sudo systemctl stop quic-to-tcp
+# Restart or stop an instance
+sudo systemctl restart quic-to-tcp@8080
+sudo systemctl stop quic-to-tcp@8080
 ```
 
-### 3. Uninstallation
-To cleanly stop services, remove systemd units, and uninstall binaries:
+### 4. Uninstallation & Instance Removal
 ```bash
-sudo ./uninstall.sh
+./uninstall.sh
 ```
+Provides an interactive menu to:
+- **Remove a specific service instance** (keeps all other tunnels running)
+- **Stop and remove all service instances**
+- **Complete uninstallation** (removes services, configurations, and installed binaries)
 
 ---
 
@@ -209,7 +223,7 @@ When registered, the server displays a ready-to-run client command:
 [+] Forwarding To:   127.0.0.1:8080
 [+] Rendezvous:      1.2.3.4:5050
 [+] Secret Code:     my_tunnel_pass
-[+] Connect with:    tcp-to-quic p2p 1.2.3.4:5050 127.0.0.1:<LOCAL_PORT> my_tunnel_pass
+[+] Connect with:    tcp-to-quic p2p 1.2.3.4:5050 127.0.0.1:8080 my_tunnel_pass
 ======================================================================
 ```
 

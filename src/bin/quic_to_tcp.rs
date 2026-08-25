@@ -148,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[+] Forwarding To:   {}", remote_tcp_addr);
             println!("[+] Rendezvous:      {}", rendezvous_addr);
             println!("[+] Secret Code:     {}", tunnel_code);
-            println!("[+] Connect with:    tcp-to-quic p2p {} 127.0.0.1:<LOCAL_PORT> {}", rendezvous_addr, tunnel_code);
+            println!("[+] Connect with:    tcp-to-quic p2p {} 127.0.0.1:{} {}", rendezvous_addr, tcp_port, tunnel_code);
             println!("======================================================================");
 
             let std_socket_raw = std_socket.try_clone()?;
