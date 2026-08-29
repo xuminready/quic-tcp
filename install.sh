@@ -171,6 +171,21 @@ if [ ! -f "$SCRIPT_DIR/target/release/quic-to-tcp" ] || \
         exit 1
     fi
 
+    # Check for build prerequisites (cmake, clang, libclang) required by quiche/boring-sys
+    if ! command -v cmake &>/dev/null || ! command -v clang &>/dev/null; then
+        echo -e "${YELLOW}[*] Build tools (cmake/clang) not detected. Checking package manager...${NC}"
+        if command -v apt-get &>/dev/null; then
+            echo -e "${BLUE}[*] Installing cmake, clang, and libclang-dev via apt...${NC}"
+            run_root apt-get update && run_root apt-get install -y cmake clang libclang-dev build-essential
+        elif command -v dnf &>/dev/null; then
+            echo -e "${BLUE}[*] Installing cmake, clang, and clang-devel via dnf...${NC}"
+            run_root dnf install -y cmake clang clang-devel gcc-c++
+        elif command -v pacman &>/dev/null; then
+            echo -e "${BLUE}[*] Installing cmake and clang via pacman...${NC}"
+            run_root pacman -S --noconfirm cmake clang base-devel
+        fi
+    fi
+
     (cd "$SCRIPT_DIR" && $CARGO_BIN build --release)
 fi
 

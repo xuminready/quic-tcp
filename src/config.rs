@@ -22,6 +22,6 @@ pub fn get_quic_config() -> quiche::Config {
     config.set_disable_active_migration(true);
     config.set_max_idle_timeout(60000);
     config.enable_pacing(false);
-    config.set_cc_algorithm(quiche::CongestionControlAlgorithm::BBR);
+    config.set_cc_algorithm(quiche::CongestionControlAlgorithm::Bbr2Gcongestion);
     config
 }

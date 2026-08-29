@@ -87,9 +87,19 @@ flowchart TD
 ### Build Prerequisites
 
 #### Linux (Debian/Ubuntu/gLinux)
-Requires `cmake`:
+Requires `cmake`, `clang`, and `libclang-dev` (used by `bindgen` for BoringSSL FFI bindings):
 ```bash
-sudo apt update && sudo apt install -y cmake
+sudo apt update && sudo apt install -y cmake clang libclang-dev build-essential
+```
+
+#### Linux (Fedora / RHEL / Rocky)
+```bash
+sudo dnf install -y cmake clang clang-devel gcc-c++
+```
+
+#### Linux (Arch Linux)
+```bash
+sudo pacman -S cmake clang base-devel
 ```
 
 #### macOS
