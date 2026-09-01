@@ -36,10 +36,12 @@ impl ClientMode {
             if args.len() >= 6 && args[3].parse::<SocketAddr>().is_err() && args[4].parse::<u16>().is_ok() {
                 let rendezvous_addr: SocketAddr = args[2]
                     .parse()
+                    .map(quic_tcp::normalize_socket_addr)
                     .map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
                 let tunnel_code = args[3].clone();
                 let local_tcp_addr: SocketAddr = args[5]
                     .parse()
+                    .map(quic_tcp::normalize_socket_addr)
                     .map_err(|e| format!("Invalid TCP local address: {}", e))?;
                 return Ok(ClientMode::P2p {
                     rendezvous_addr,
@@ -54,9 +56,11 @@ impl ClientMode {
 
             let rendezvous_addr: SocketAddr = args[2]
                 .parse()
+                .map(quic_tcp::normalize_socket_addr)
                 .map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
             let local_tcp_addr: SocketAddr = args[3]
                 .parse()
+                .map(quic_tcp::normalize_socket_addr)
                 .map_err(|e| format!("Invalid TCP local address: {}", e))?;
             let tunnel_code = if args.len() > 4 {
                 args[4].clone()
@@ -76,10 +80,12 @@ impl ClientMode {
             }
             let local_tcp_addr: SocketAddr = args[1 + offset]
                 .parse()
+                .map(quic_tcp::normalize_socket_addr)
                 .map_err(|e| format!("Invalid TCP local address: {}", e))?;
             let remote_udp_addr: SocketAddr = args[2 + offset]
                 .parse()
-                .map_err(|e| format!("Invalid UDP remote address: {}", e))?;
+                .map(quic_tcp::normalize_socket_addr)
+                .map_err(|e| format!("Invalid Remote UDP address: {}", e))?;
             let tunnel_code = if args.len() > 3 + offset {
                 args[3 + offset].clone()
             } else {
@@ -377,6 +383,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 panic!("recv() failed: {e:?}");
                             }
                         };
+                        let from = quic_tcp::normalize_socket_addr(from);
 
                         let pkt_buf = &mut buf[..len];
 

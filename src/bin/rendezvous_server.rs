@@ -1,4 +1,5 @@
 use quic_tcp::auth::{compute_auth, next_seq, ReplayFilter};
+use quic_tcp::normalize_socket_addr;
 use quic_tcp::protocol::{ClientConn, ClientReset, PunchSignal, RegOk, ServerReg, ServerStatusMsg};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
@@ -272,6 +273,27 @@ impl RendezvousServer {
         let target_addr = target_record.public_addr;
         let tunnel_id = target_record.tunnel_id.clone();
         let srv_code = target_record.tunnel_code.clone();
+
+        // Check that both peers use the same IP family (IPv4 vs IPv6)
+        if src.is_ipv4() != target_addr.is_ipv4() {
+            let client_ip_type = if src.is_ipv4() { "IPv4" } else { "IPv6" };
+            let server_ip_type = if target_addr.is_ipv4() { "IPv4" } else { "IPv6" };
+            eprintln!(
+                "[IP MISMATCH ERROR] Tunnel ID '{}': Client ({}: {}) and Server ({}: {}) use different IP versions. Rejecting connection.",
+                conn.tunnel_id, client_ip_type, src, server_ip_type, target_addr
+            );
+            println!(
+                "[IP MISMATCH ERROR] Tunnel ID '{}': Client ({}: {}) and Server ({}: {}) use different IP versions. Rejecting connection.",
+                conn.tunnel_id, client_ip_type, src, server_ip_type, target_addr
+            );
+            let err_msg = format!(
+                "ERR IP address family mismatch: client is using {} ({}) but server is registered with {} ({})",
+                client_ip_type, src, server_ip_type, target_addr
+            );
+            self.socket.send_to(err_msg.as_bytes(), src).ok();
+            return;
+        }
+
         println!(
             "[Auth OK] Connecting client {} to server '{}' ({}) - Status -> BUSY",
             src, tunnel_id, target_addr
@@ -336,6 +358,27 @@ impl RendezvousServer {
         let target_addr = target_record.public_addr;
         let tunnel_id = target_record.tunnel_id.clone();
         let srv_code = target_record.tunnel_code.clone();
+
+        // Check that both peers use the same IP family (IPv4 vs IPv6)
+        if src.is_ipv4() != target_addr.is_ipv4() {
+            let client_ip_type = if src.is_ipv4() { "IPv4" } else { "IPv6" };
+            let server_ip_type = if target_addr.is_ipv4() { "IPv4" } else { "IPv6" };
+            eprintln!(
+                "[IP MISMATCH ERROR] Tunnel ID '{}': Client ({}: {}) and Server ({}: {}) use different IP versions during RESET. Rejecting.",
+                reset.tunnel_id, client_ip_type, src, server_ip_type, target_addr
+            );
+            println!(
+                "[IP MISMATCH ERROR] Tunnel ID '{}': Client ({}: {}) and Server ({}: {}) use different IP versions during RESET. Rejecting.",
+                reset.tunnel_id, client_ip_type, src, server_ip_type, target_addr
+            );
+            let err_msg = format!(
+                "ERR IP address family mismatch: client is using {} ({}) but server is registered with {} ({})",
+                client_ip_type, src, server_ip_type, target_addr
+            );
+            self.socket.send_to(err_msg.as_bytes(), src).ok();
+            return;
+        }
+
         println!(
             "[RESET ACCEPTED] Client {} reported dead socket. Signaling server '{}' ({}) to reset and restart hole punching...",
             src, tunnel_id, target_addr
@@ -358,12 +401,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let bind_arg = if args.len() > 1 { &args[1] } else { "5050" };
 
-    let bind_addr = if bind_arg.contains(':') {
-        bind_arg.to_string()
+    let bind_addr: SocketAddr = if let Ok(addr) = bind_arg.parse::<SocketAddr>() {
+        addr
+    } else if let Ok(port) = bind_arg.parse::<u16>() {
+        format!("0.0.0.0:{}", port).parse().unwrap()
     } else {
-        format!("0.0.0.0:{}", bind_arg)
+        use std::net::ToSocketAddrs;
+        bind_arg
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| format!("Failed to resolve bind address: {}", bind_arg))?
     };
-    let socket = UdpSocket::bind(&bind_addr)?;
+
+    let socket = UdpSocket::bind(bind_addr)?;
     socket.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
     println!(
         "Rendezvous Server listening on {} (Unified Secret Auth & Replay Filter ACTIVE)",
@@ -396,6 +446,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match server.socket.recv_from(&mut buf) {
             Ok((len, src)) => {
+                let src = normalize_socket_addr(src);
                 let text = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                 if text.starts_with("REG ") {
                     server.handle_reg(text, src);

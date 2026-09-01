@@ -1,4 +1,5 @@
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub fn would_block(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::WouldBlock
@@ -48,6 +49,24 @@ pub fn next_stream_id(current: &mut u64) -> u64 {
     next
 }
 
+/// Normalizes a SocketAddr, converting IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`)
+/// to their canonical native IPv4 representation (`a.b.c.d`).
+pub fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => {
+            let octets = v6.ip().octets();
+            // Check if it's an IPv4-mapped IPv6 address (::ffff:x.x.x.x)
+            if octets[0..10] == [0; 10] && octets[10] == 0xff && octets[11] == 0xff {
+                let v4 = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                SocketAddr::new(IpAddr::V4(v4), v6.port())
+            } else {
+                SocketAddr::V6(v6)
+            }
+        }
+        v4 => v4,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +96,20 @@ mod tests {
         assert_eq!(next_stream_id(&mut limit_id), 4);
         // The subsequent call returns 8
         assert_eq!(next_stream_id(&mut limit_id), 8);
+    }
+
+    #[test]
+    fn test_normalize_socket_addr() {
+        // Native IPv4 remains unchanged
+        let v4_addr: SocketAddr = "223.73.209.117:5759".parse().unwrap();
+        assert_eq!(normalize_socket_addr(v4_addr), v4_addr);
+
+        // IPv4-mapped IPv6 is converted to canonical IPv4
+        let mapped_addr: SocketAddr = "[::ffff:223.73.209.117]:5759".parse().unwrap();
+        assert_eq!(normalize_socket_addr(mapped_addr), v4_addr);
+
+        // Native IPv6 remains unchanged
+        let v6_addr: SocketAddr = "[2001:db8::1]:5759".parse().unwrap();
+        assert_eq!(normalize_socket_addr(v6_addr), v6_addr);
     }
 }

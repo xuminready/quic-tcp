@@ -20,7 +20,7 @@ pub fn perform_hole_punching(
     passcode: &str,
 ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
     socket.set_read_timeout(Some(Duration::from_millis(50)))?;
-    let mut peer_addr = peer_addr;
+    let mut peer_addr = crate::utils::normalize_socket_addr(peer_addr);
     let mut buf = [0; 1024];
     let mut replay_filter = ReplayFilter::new();
 
@@ -54,7 +54,8 @@ pub fn perform_hole_punching(
             let probe_msg = match current_step {
                 1 => PeerProbe::new_punch(passcode),
                 2 => PeerProbe::new_ack(passcode),
-                _ => PeerProbe::new_ack_ack(passcode),
+                3 => PeerProbe::new_ack_ack(passcode),
+                _ => unreachable!(),
             };
             socket.send_to(probe_msg.as_bytes(), peer_addr)?;
 
@@ -72,6 +73,7 @@ pub fn perform_hole_punching(
 
             match socket.recv_from(&mut buf) {
                 Ok((len, src)) => {
+                    let src = crate::utils::normalize_socket_addr(src);
                     let text = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                     if src.ip() == peer_addr.ip() {
                         if let Some(probe) = PeerProbe::parse(text) {
@@ -213,6 +215,7 @@ pub fn run_server_p2p_handshake(
     tunnel_code: &str,
     tcp_port: u16,
 ) -> Result<(UdpSocket, String), Box<dyn std::error::Error>> {
+    let rendezvous_addr = crate::utils::normalize_socket_addr(rendezvous_addr);
     let tunnel_id = derive_tunnel_id(tunnel_code);
     let bind_addr = match rendezvous_addr {
         SocketAddr::V4(_) => "0.0.0.0:0",
@@ -234,7 +237,7 @@ pub fn run_server_p2p_handshake(
         socket.send_to(reg_msg.as_bytes(), rendezvous_addr)?;
 
         match socket.recv_from(&mut buf) {
-            Ok((len, src)) if src == rendezvous_addr => {
+            Ok((len, src)) if crate::utils::normalize_socket_addr(src) == rendezvous_addr => {
                 let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                 if let Some(ok) = RegOk::parse(reply) {
                     if ok.verify(tunnel_code) {
@@ -268,7 +271,7 @@ pub fn run_server_p2p_handshake(
         println!("Waiting for peer connection (sending authenticated keep-alives every 10s)...");
         let peer_addr = loop {
             match socket.recv_from(&mut buf) {
-                Ok((len, src)) if src == rendezvous_addr => {
+                Ok((len, src)) if crate::utils::normalize_socket_addr(src) == rendezvous_addr => {
                     let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                     if let Some(signal) = PunchSignal::parse(reply) {
                         if signal.verify(tunnel_code) {
@@ -356,6 +359,7 @@ pub fn run_client_p2p_handshake(
     rendezvous_addr: SocketAddr,
     tunnel_code: &str,
 ) -> Result<(UdpSocket, SocketAddr, String), Box<dyn std::error::Error>> {
+    let rendezvous_addr = crate::utils::normalize_socket_addr(rendezvous_addr);
     let tunnel_id = derive_tunnel_id(tunnel_code);
     let max_handshake_attempts = 3;
 
@@ -396,7 +400,7 @@ pub fn run_client_p2p_handshake(
             socket.send_to(conn_msg.as_bytes(), rendezvous_addr)?;
 
             match socket.recv_from(&mut buf) {
-                Ok((len, src)) if src == rendezvous_addr => {
+                Ok((len, src)) if crate::utils::normalize_socket_addr(src) == rendezvous_addr => {
                     let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                     if let Some(signal) = PunchSignal::parse(reply) {
                         if signal.verify(tunnel_code) {
@@ -409,7 +413,7 @@ pub fn run_client_p2p_handshake(
                         last_err = reply.to_string();
                         warn!("[P2P Client] Rendezvous Server rejected connection: {}", reply);
                         println!("[P2P Client] Rendezvous Server rejected connection: {}", reply);
-                        if reply.contains("Authentication failed") || reply.contains("No server registered") {
+                        if reply.contains("Authentication failed") || reply.contains("No server registered") || reply.contains("IP address family mismatch") {
                             error!("[P2P Client ERROR] Connection rejected: {}. Giving up.", reply);
                             eprintln!("[P2P Client ERROR] Connection rejected: {}. Giving up.", reply);
                             return Err(reply.into());
@@ -424,7 +428,7 @@ pub fn run_client_p2p_handshake(
         let peer_addr = match peer_addr {
             Some(addr) => addr,
             None => {
-                if !last_err.is_empty() && (last_err.contains("Authentication failed") || last_err.contains("No server registered")) {
+                if !last_err.is_empty() && (last_err.contains("Authentication failed") || last_err.contains("No server registered") || last_err.contains("IP address family mismatch")) {
                     return Err(last_err.into());
                 }
                 if attempt < max_handshake_attempts {
@@ -539,6 +543,7 @@ pub fn reconnect_client_p2p_handshake(
     rendezvous_addr: SocketAddr,
     tunnel_code: &str,
 ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let rendezvous_addr = crate::utils::normalize_socket_addr(rendezvous_addr);
     let tunnel_id = derive_tunnel_id(tunnel_code);
     let max_reconnect_attempts = 3;
 
@@ -562,7 +567,7 @@ pub fn reconnect_client_p2p_handshake(
             socket.send_to(reset_msg.as_bytes(), rendezvous_addr)?;
 
             match socket.recv_from(&mut buf) {
-                Ok((len, src)) if src == rendezvous_addr => {
+                Ok((len, src)) if crate::utils::normalize_socket_addr(src) == rendezvous_addr => {
                     let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                     if let Some(signal) = PunchSignal::parse(reply) {
                         if signal.verify(tunnel_code) {
@@ -574,7 +579,7 @@ pub fn reconnect_client_p2p_handshake(
                     } else if reply.starts_with("ERR") {
                         last_err = reply.to_string();
                         warn!("[P2P Reconnect] Reset request rejected: {}", reply);
-                        if reply.contains("Authentication failed") || reply.contains("No server registered") {
+                        if reply.contains("Authentication failed") || reply.contains("No server registered") || reply.contains("IP address family mismatch") {
                             return Err(reply.into());
                         }
                     }
@@ -680,6 +685,8 @@ pub fn server_handle_reconnect_punch(
     tcp_port: u16,
     tunnel_code: &str,
 ) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let client_addr = crate::utils::normalize_socket_addr(client_addr);
+    let rendezvous_addr = crate::utils::normalize_socket_addr(rendezvous_addr);
     info!(
         "[P2P Server Reconnect] Received request for client {}. Starting UDP hole punching...",
         client_addr

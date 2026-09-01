@@ -45,10 +45,12 @@ impl ServerMode {
                 // Legacy syntax
                 let rendezvous_addr: SocketAddr = args[2]
                     .parse()
+                    .map(quic_tcp::normalize_socket_addr)
                     .map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
                 let remote_tcp_addr_str = if args.len() >= 7 { &args[6] } else { &args[5] };
                 let remote_tcp_addr: SocketAddr = remote_tcp_addr_str
                     .parse()
+                    .map(quic_tcp::normalize_socket_addr)
                     .map_err(|e| format!("Invalid TCP remote address: {}", e))?;
                 let tunnel_code = if args.len() >= 7 {
                     args[5].clone()
@@ -68,9 +70,11 @@ impl ServerMode {
 
             let rendezvous_addr: SocketAddr = args[2]
                 .parse()
+                .map(quic_tcp::normalize_socket_addr)
                 .map_err(|e| format!("Invalid Rendezvous server address: {}", e))?;
             let remote_tcp_addr: SocketAddr = args[3]
                 .parse()
+                .map(quic_tcp::normalize_socket_addr)
                 .map_err(|e| format!("Invalid TCP remote address: {}", e))?;
             let tunnel_code = if args.len() > 4 {
                 args[4].clone()
@@ -90,9 +94,11 @@ impl ServerMode {
             }
             let local_udp_addr: SocketAddr = args[1 + offset]
                 .parse()
+                .map(quic_tcp::normalize_socket_addr)
                 .map_err(|e| format!("Invalid UDP local address: {}", e))?;
             let remote_tcp_addr: SocketAddr = args[2 + offset]
                 .parse()
+                .map(quic_tcp::normalize_socket_addr)
                 .map_err(|e| format!("Invalid TCP remote address: {}", e))?;
             let tunnel_code = if args.len() > 3 + offset {
                 args[3 + offset].clone()
@@ -300,6 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 panic!("recv() failed: {:?}", e);
                             }
                         };
+                        let from = quic_tcp::normalize_socket_addr(from);
 
                         let pkt_buf = &mut buf[..len];
 

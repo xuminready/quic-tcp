@@ -209,6 +209,7 @@ pub enum PunchSignal {
 
 impl PunchSignal {
     pub fn new_passive_signed(client_addr: SocketAddr, tunnel_code: &str) -> String {
+        let client_addr = crate::utils::normalize_socket_addr(client_addr);
         let seq = next_seq();
         let payload = format!("PUNCH:{}:passive:{}", client_addr, seq);
         let hmac = compute_auth(tunnel_code, &payload);
@@ -216,6 +217,7 @@ impl PunchSignal {
     }
 
     pub fn new_active_signed(server_addr: SocketAddr, tunnel_code: &str) -> String {
+        let server_addr = crate::utils::normalize_socket_addr(server_addr);
         let seq = next_seq();
         let payload = format!("PUNCH:{}:active:{}", server_addr, seq);
         let hmac = compute_auth(tunnel_code, &payload);
@@ -229,14 +231,16 @@ impl PunchSignal {
         }
 
         if parts.len() >= 5 && parts[2] == "passive" {
+            let addr: SocketAddr = parts[1].parse().ok()?;
             Some(PunchSignal::Passive {
-                client_addr: parts[1].parse().ok()?,
+                client_addr: crate::utils::normalize_socket_addr(addr),
                 seq: parts[3].parse().ok()?,
                 hmac: parts[4].to_string(),
             })
         } else if parts.len() >= 5 && parts[2] == "active" {
+            let addr: SocketAddr = parts[1].parse().ok()?;
             Some(PunchSignal::Active {
-                server_addr: parts[1].parse().ok()?,
+                server_addr: crate::utils::normalize_socket_addr(addr),
                 seq: parts[3].parse().ok()?,
                 hmac: parts[4].to_string(),
             })
@@ -248,10 +252,12 @@ impl PunchSignal {
     pub fn verify(&self, tunnel_code: &str) -> bool {
         match self {
             PunchSignal::Passive { client_addr, seq, hmac } => {
+                let client_addr = crate::utils::normalize_socket_addr(*client_addr);
                 let payload = format!("PUNCH:{}:passive:{}", client_addr, seq);
                 verify_auth(tunnel_code, &payload, hmac)
             }
             PunchSignal::Active { server_addr, seq, hmac } => {
+                let server_addr = crate::utils::normalize_socket_addr(*server_addr);
                 let payload = format!("PUNCH:{}:active:{}", server_addr, seq);
                 verify_auth(tunnel_code, &payload, hmac)
             }
