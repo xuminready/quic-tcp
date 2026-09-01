@@ -240,8 +240,22 @@ COMPONENT_CHOICE=${COMPONENT_CHOICE:-2}
 
 configure_rendezvous() {
     echo -e "\n${CYAN}--- Configuring Rendezvous Server Instance ---${NC}"
+    echo "Select Listening Interface:"
+    echo "  1) Dual-Stack (Listen on all IPv6 & IPv4 interfaces [::]:<port>) [Recommended]"
+    echo "  2) IPv4 Only  (Listen on all IPv4 interfaces 0.0.0.0:<port>)"
+    read -rp "Enter choice [1-2] (default: 1): " IP_CHOICE
+    IP_CHOICE=${IP_CHOICE:-1}
+
     read -rp "Enter UDP listening port [5050]: " RDV_PORT
     RDV_PORT=${RDV_PORT:-5050}
+
+    if [ "$IP_CHOICE" -eq 1 ]; then
+        BIND_ADDR="[::]:${RDV_PORT}"
+        BIND_DESC="all IPv6/IPv4 interfaces (Dual-Stack) on ${BIND_ADDR}"
+    else
+        BIND_ADDR="0.0.0.0:${RDV_PORT}"
+        BIND_DESC="all IPv4 interfaces on ${BIND_ADDR}"
+    fi
 
     read -rp "Enter unique instance name/identifier [${RDV_PORT}]: " INSTANCE_NAME
     INSTANCE_NAME=${INSTANCE_NAME:-$RDV_PORT}
@@ -250,7 +264,7 @@ configure_rendezvous() {
 
     cat <<EOF | write_root_file "$CONFIG_DIR/rendezvous-server-${INSTANCE_NAME}.env" 600
 # QUIC-TCP Rendezvous Server Configuration (${INSTANCE_NAME})
-PORT=${RDV_PORT}
+PORT=${BIND_ADDR}
 RUST_LOG=info
 RENDEZVOUS_PEER_TIMEOUT_SECS=30
 RENDEZVOUS_CLEANUP_TIMEOUT_SECS=120
@@ -259,7 +273,7 @@ EOF
     local service_unit="rendezvous-server@${INSTANCE_NAME}.service"
     run_root systemctl daemon-reload
     run_root systemctl enable --now "$service_unit"
-    echo -e "${GREEN}[+] ${service_unit} configured and started on UDP port ${RDV_PORT}.${NC}"
+    echo -e "${GREEN}[+] ${service_unit} configured and started on ${BIND_DESC}.${NC}"
 }
 
 configure_quic_to_tcp() {
