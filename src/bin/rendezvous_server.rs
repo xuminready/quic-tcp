@@ -356,9 +356,13 @@ impl RendezvousServer {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let port = if args.len() > 1 { &args[1] } else { "5050" };
+    let bind_arg = if args.len() > 1 { &args[1] } else { "5050" };
 
-    let bind_addr = format!("0.0.0.0:{}", port);
+    let bind_addr = if bind_arg.contains(':') {
+        bind_arg.to_string()
+    } else {
+        format!("0.0.0.0:{}", bind_arg)
+    };
     let socket = UdpSocket::bind(&bind_addr)?;
     socket.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
     println!(

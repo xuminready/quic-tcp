@@ -326,7 +326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             poll.registry().deregister(&mut udp_socket).ok();
                                             info.std_socket_raw.set_nonblocking(false).ok();
 
-                                            let _ = server_handle_reconnect_punch(
+                                            let reconnect_res = server_handle_reconnect_punch(
                                                 &info.std_socket_raw,
                                                 client_addr,
                                                 info.rendezvous_addr,
@@ -340,7 +340,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 .register(&mut udp_socket, UDP_TOKEN, mio::Interest::READABLE)
                                                 .unwrap();
                                             info.last_keepalive = Instant::now();
-                                            info.status = "BUSY".to_string();
+                                            if reconnect_res.is_ok() {
+                                                info.status = "BUSY".to_string();
+                                            } else {
+                                                warn!("[P2P Server Reconnect] Hole punching failed with client {}. Re-registered as IDLE at Rendezvous Server.", client_addr);
+                                                info.status = "IDLE".to_string();
+                                            }
                                         }
                                     }
                                 } else {

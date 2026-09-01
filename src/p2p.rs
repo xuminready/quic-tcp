@@ -262,29 +262,79 @@ pub fn run_server_p2p_handshake(
         );
         return Err("Failed to register at Rendezvous Server: timeout or rejected".into());
     }
-    println!("Registration successful at Rendezvous Server.");
-
-    // 2. Wait for authenticated PUNCH signal from Rendezvous Server
-    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
-    println!("Waiting for peer connection (sending authenticated keep-alives every 10s)...");
-    let peer_addr = loop {
-        match socket.recv_from(&mut buf) {
-            Ok((len, src)) if src == rendezvous_addr => {
-                let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
-                if let Some(signal) = PunchSignal::parse(reply) {
-                    if signal.verify(tunnel_code) {
-                        if let PunchSignal::Passive { client_addr, .. } = signal {
-                            break client_addr;
+    // 2. Wait for authenticated PUNCH signal from Rendezvous Server & perform hole punching
+    let _final_peer_addr = loop {
+        socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+        println!("Waiting for peer connection (sending authenticated keep-alives every 10s)...");
+        let peer_addr = loop {
+            match socket.recv_from(&mut buf) {
+                Ok((len, src)) if src == rendezvous_addr => {
+                    let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
+                    if let Some(signal) = PunchSignal::parse(reply) {
+                        if signal.verify(tunnel_code) {
+                            if let PunchSignal::Passive { client_addr, .. } = signal {
+                                break client_addr;
+                            }
+                        } else {
+                            warn!("Received unauthenticated PUNCH packet from Rendezvous Server, dropping.");
                         }
-                    } else {
-                        warn!("Received unauthenticated PUNCH packet from Rendezvous Server, dropping.");
                     }
                 }
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // Timeout, send authenticated keep-alive
+                    let _ = send_server_keepalive(
+                        &socket,
+                        rendezvous_addr,
+                        &tunnel_id,
+                        tcp_port,
+                        "IDLE",
+                        tunnel_code,
+                    );
+                }
+                Err(e) => {
+                    error!("[P2P Server ERROR] Socket error while waiting for connection: {}. Giving up.", e);
+                    eprintln!("[P2P Server ERROR] Socket error while waiting for connection: {}. Giving up.", e);
+                    return Err(e.into());
+                }
+                _ => {}
             }
-            Err(ref e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                // Timeout, send authenticated keep-alive
+        };
+
+        // 3. Hole Punching Phase with client
+        info!(
+            "[P2P Server] Received authenticated connection request from {}. Starting UDP hole punching...",
+            peer_addr
+        );
+        println!(
+            "[P2P Server] Received authenticated connection request from {}. Starting UDP hole punching...",
+            peer_addr
+        );
+
+        match perform_hole_punching(&socket, peer_addr, tunnel_code) {
+            Ok(addr) => {
+                info!(
+                    "[P2P Server] UDP hole punching succeeded with peer {}",
+                    addr
+                );
+                println!(
+                    "[P2P Server] UDP hole punching succeeded with peer {}",
+                    addr
+                );
+                break addr;
+            }
+            Err(e) => {
+                warn!(
+                    "[P2P Server] Hole punching failed with client {}: {}. Starting over and re-registering as IDLE at Rendezvous Server...",
+                    peer_addr, e
+                );
+                println!(
+                    "[P2P Server] Hole punching failed with client {}: {}. Starting over and re-registering as IDLE at Rendezvous Server...",
+                    peer_addr, e
+                );
+
+                // Re-register to Rendezvous Server as IDLE
                 let _ = send_server_keepalive(
                     &socket,
                     rendezvous_addr,
@@ -294,43 +344,8 @@ pub fn run_server_p2p_handshake(
                     tunnel_code,
                 );
             }
-            Err(e) => {
-                error!("[P2P Server ERROR] Socket error while waiting for connection: {}. Giving up.", e);
-                eprintln!("[P2P Server ERROR] Socket error while waiting for connection: {}. Giving up.", e);
-                return Err(e.into());
-            }
-            _ => {}
         }
     };
-
-    // 3. Hole Punching Phase with client
-    info!(
-        "[P2P Server] Received authenticated connection request from {}. Starting UDP hole punching...",
-        peer_addr
-    );
-    let final_peer_addr = match perform_hole_punching(&socket, peer_addr, tunnel_code) {
-        Ok(addr) => addr,
-        Err(e) => {
-            error!(
-                "[P2P Server ERROR] Hole punching failed with client {}: {}. Giving up.",
-                peer_addr, e
-            );
-            eprintln!(
-                "[P2P Server ERROR] Hole punching failed with client {}: {}. Giving up.",
-                peer_addr, e
-            );
-            return Err(e);
-        }
-    };
-
-    info!(
-        "[P2P Server] UDP hole punching succeeded with peer {}",
-        final_peer_addr
-    );
-    println!(
-        "[P2P Server] UDP hole punching succeeded with peer {}",
-        final_peer_addr
-    );
 
     socket.set_read_timeout(None)?;
     Ok((socket, tunnel_id))
@@ -676,14 +691,23 @@ pub fn server_handle_reconnect_punch(
     let final_peer_addr = match perform_hole_punching(socket, client_addr, tunnel_code) {
         Ok(addr) => addr,
         Err(e) => {
-            error!(
-                "[P2P Server Reconnect ERROR] Hole punching failed with client {}: {}. Giving up.",
+            warn!(
+                "[P2P Server Reconnect] Hole punching failed with client {}: {}. Re-registering as IDLE at Rendezvous Server...",
                 client_addr, e
             );
-            eprintln!(
-                "[P2P Server Reconnect ERROR] Hole punching failed with client {}: {}. Giving up.",
+            println!(
+                "[P2P Server Reconnect] Hole punching failed with client {}: {}. Re-registering as IDLE at Rendezvous Server...",
                 client_addr, e
             );
+            let _ = send_server_keepalive(
+                socket,
+                rendezvous_addr,
+                tunnel_id,
+                tcp_port,
+                "IDLE",
+                tunnel_code,
+            );
+            socket.set_read_timeout(None)?;
             return Err(e);
         }
     };

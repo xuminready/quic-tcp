@@ -178,15 +178,18 @@ Provides an interactive menu to:
 
 ### Mode 1: Direct Mode (Static Remote Endpoint)
 
-Use Direct Mode when `quic-to-tcp` has a publicly accessible IP address or configured port forwarding.
+Use Direct Mode when `quic-to-tcp` has a publicly accessible IP address or configured port forwarding. Supports both **IPv4** and **IPv6** (using standard bracket notation `[IPv6]:Port`).
 
 #### 1. Start Server Proxy (`quic-to-tcp`)
 Listens on UDP for QUIC connections and proxies streams to a local TCP target server:
 ```bash
 RUST_LOG=info cargo run --release --bin quic-to-tcp <Local_UDP_IP:Port> <Remote_TCP_IP:Port> [Secret_Code]
 
-# Example: listen on UDP port 4433, forward to local TCP port 8080 with code 'my_secret_123':
+# IPv4 Example: listen on UDP port 4433, forward to local TCP port 8080:
 RUST_LOG=info cargo run --release --bin quic-to-tcp 127.0.0.1:4433 127.0.0.1:8080 my_secret_123
+
+# IPv6 Example: listen on all IPv6 interfaces [::]:4433, forward to local IPv6 TCP service [::1]:8080:
+RUST_LOG=info cargo run --release --bin quic-to-tcp [::]:4433 [::1]:8080 my_secret_123
 ```
 
 #### 2. Start Client Proxy (`tcp-to-quic`)
@@ -194,23 +197,29 @@ Listens on a local TCP port, connects to remote UDP server, authenticates over s
 ```bash
 RUST_LOG=info cargo run --release --bin tcp-to-quic <Local_TCP_IP:Port> <Remote_UDP_IP:Port> [Secret_Code]
 
-# Example: listen on local TCP port 7070, bridge to 127.0.0.1:4433 with code 'my_secret_123':
+# IPv4 Example: listen on local TCP port 7070, bridge to 127.0.0.1:4433:
 RUST_LOG=info cargo run --release --bin tcp-to-quic 127.0.0.1:7070 127.0.0.1:4433 my_secret_123
+
+# IPv6 Example: listen on local IPv6 port [::]:7070, bridge to remote IPv6 server [2001:db8::1]:4433:
+RUST_LOG=info cargo run --release --bin tcp-to-quic [::]:7070 [2001:db8::1]:4433 my_secret_123
 ```
 
 ---
 
 ### Mode 2: P2P Mode (Authenticated UDP Hole Punching)
 
-Use P2P Mode when peers are behind NATs or firewalls. Only **3 parameters** are required!
+Use P2P Mode when peers are behind NATs or firewalls. Only **3 parameters** are required! Works seamlessly across both IPv4 and IPv6 networks.
 
 #### 1. Start the Rendezvous Server
 Run on a public server endpoint (or locally for testing):
 ```bash
-RUST_LOG=info cargo run --release --bin rendezvous-server [port]
+RUST_LOG=info cargo run --release --bin rendezvous-server [port_or_bind_addr]
 
-# Example (listening on port 5050):
+# IPv4 Example (listening on all IPv4 interfaces on port 5050):
 RUST_LOG=info cargo run --release --bin rendezvous-server 5050
+
+# IPv6 / Dual-Stack Example (listening on all IPv6 interfaces on port 5050):
+RUST_LOG=info cargo run --release --bin rendezvous-server [::]:5050
 ```
 
 Environment variables (optional):
@@ -222,8 +231,11 @@ Registers at `rendezvous-server` using `[Secret_Code]` and forwards incoming con
 ```bash
 RUST_LOG=info cargo run --release --bin quic-to-tcp p2p <Rendezvous_Server_IP:Port> <Remote_TCP_IP:Port> [Secret_Code]
 
-# Example: forward to local TCP port 8080 through rendezvous 1.2.3.4:5050 using code 'my_tunnel_pass':
+# IPv4 Example: forward to local TCP port 8080 through rendezvous 1.2.3.4:5050 using code 'my_tunnel_pass':
 RUST_LOG=info cargo run --release --bin quic-to-tcp p2p 1.2.3.4:5050 127.0.0.1:8080 my_tunnel_pass
+
+# IPv6 Example: forward to local IPv6 port [::1]:8080 through IPv6 rendezvous [2001:db8::100]:5050:
+RUST_LOG=info cargo run --release --bin quic-to-tcp p2p [2001:db8::100]:5050 [::1]:8080 my_tunnel_pass
 ```
 
 When registered, the server displays a ready-to-run client command:
@@ -242,9 +254,20 @@ Listens on local TCP port, connects to rendezvous server with `[Secret_Code]`, p
 ```bash
 RUST_LOG=info cargo run --release --bin tcp-to-quic p2p <Rendezvous_Server_IP:Port> <Local_TCP_IP:Port> [Secret_Code]
 
-# Example: listen on local TCP port 7070 and connect to the tunnel using code 'my_tunnel_pass':
+# IPv4 Example: listen on local TCP port 7070 and connect to the tunnel:
 RUST_LOG=info cargo run --release --bin tcp-to-quic p2p 1.2.3.4:5050 127.0.0.1:7070 my_tunnel_pass
+
+# IPv6 Example: listen on local IPv6 port [::]:7070 and connect via IPv6 rendezvous:
+RUST_LOG=info cargo run --release --bin tcp-to-quic p2p [2001:db8::100]:5050 [::]:7070 my_tunnel_pass
 ```
+
+---
+
+### IPv6 & Dual-Stack Support Notes
+
+- **Bracket Notation**: All IPv6 addresses should be enclosed in brackets with their port, e.g. `[::1]:8080`, `[2001:db8::1]:4433`, or `[::]:7070`.
+- **Automatic Socket Family Detection**: In P2P mode, both `quic-to-tcp` and `tcp-to-quic` inspect the Rendezvous address and automatically bind their underlying UDP socket to `[::]:0` for IPv6 or `0.0.0.0:0` for IPv4.
+- **Firewall Traversal on IPv6**: Because IPv6 typically uses stateful firewalls without address translation (no CGNAT/Symmetric NAT), the 3-way UDP hole-punching protocol (`PEER_PUNCH`) opens inbound firewall pinholes with 100% reliability.
 
 ---
 
