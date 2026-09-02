@@ -202,12 +202,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let mut tcp_server = mio::net::TcpListener::bind(tcp_local_addr).unwrap();
-    info!("TCP listener bound to {}, waiting for local connections.", tcp_local_addr);
-
-    poll.registry()
-        .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)
-        .unwrap();
+    let mut tcp_server = quic_tcp::bind_tcp_listener(tcp_local_addr).unwrap();
+    info!("TCP listener bound to {}, waiting for QUIC tunnel authentication.", tcp_local_addr);
+    let mut tcp_server_registered = false;
 
     poll.registry()
         .register(&mut udp_socket, UDP_TOKEN, mio::Interest::READABLE)
@@ -216,7 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = get_quic_config();
     let local_addr = udp_socket.local_addr().unwrap();
     let mut session = create_quic_connection(peer_addr, local_addr, &mut config);
-    let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+    let _ = session.flush_quic_to_udp(&udp_socket);
 
     let mut current_stream_id: u64 = 4; // Streams start at 4 (stream 0 reserved for auth)
     let mut unique_token = mio::Token(UDP_TOKEN.0 + 1);
@@ -243,6 +240,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         poll.poll(&mut events, timeout).unwrap();
 
+        if session.is_authenticated && !tcp_server_registered {
+            poll.registry()
+                .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)
+                .unwrap();
+            tcp_server_registered = true;
+            info!("QUIC tunnel authenticated! TCP listener accepting connections on {}.", tcp_local_addr);
+            println!("QUIC tunnel authenticated! TCP listener accepting connections on {}.", tcp_local_addr);
+        }
+
         // Send stream 0 auth packet as soon as early data or established is ready
         session.send_auth_packet(&tunnel_code);
 
@@ -251,7 +257,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if session.conn.is_established() || session.conn.is_in_early_data() {
                 debug!("Sending periodic PING keepalive to maintain NAT mapping with peer {}", peer_addr);
                 session.conn.send_ack_eliciting().ok();
-                let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+                let _ = session.flush_quic_to_udp(&udp_socket);
             }
             last_probe_time = Instant::now();
         }
@@ -281,6 +287,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "WARNING: Hole punched UDP socket to server (Tunnel ID '{}', {}) is no longer usable ({}). Reporting to Rendezvous Server and restarting hole punching...",
                     info.tunnel_id, peer_addr, reason
                 );
+
+                if tcp_server_registered {
+                    poll.registry().deregister(&mut tcp_server).ok();
+                    tcp_server_registered = false;
+                }
 
                 // Drain and deregister active TCP streams
                 for (_, mut tcp_stream) in session.tcp_streams.drain() {
@@ -326,7 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap();
 
                 session = create_quic_connection(peer_addr, local_addr, &mut config);
-                let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+                let _ = session.flush_quic_to_udp(&udp_socket);
                 was_established = false;
                 current_stream_id = 4;
                 last_recv_time = Instant::now();
@@ -367,7 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+        let _ = session.flush_quic_to_udp(&udp_socket);
 
         for event in events.iter() {
             match event.token() {
@@ -427,13 +438,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Send auth packet if not sent yet
                     session.send_auth_packet(&tunnel_code);
 
-                    // Process all readable streams
-                    for stream_id in session.conn.readable() {
+                    // Process all readable streams (ensuring Stream 0 is processed first)
+                    let mut readable_streams: Vec<u64> = session.conn.readable().collect();
+                    if let Some(pos) = readable_streams.iter().position(|&s| s == 0) {
+                        readable_streams.remove(pos);
+                        readable_streams.insert(0, 0);
+                    }
+
+                    for stream_id in readable_streams {
                         if stream_id == 0 {
                             match session.process_client_auth_reply(&tunnel_code, &mut auth_filter) {
                                 Ok(true) => {
                                     info!("[Auth OK] Direct/P2P connection authenticated successfully with remote server!");
                                     println!("[Auth OK] Direct/P2P connection authenticated successfully with remote server!");
+                                    if !tcp_server_registered {
+                                        poll.registry()
+                                            .register(&mut tcp_server, TCP_TOKEN, mio::Interest::READABLE)
+                                            .unwrap();
+                                        tcp_server_registered = true;
+                                        info!("QUIC tunnel authenticated! TCP listener accepting connections on {}.", tcp_local_addr);
+                                        println!("QUIC tunnel authenticated! TCP listener accepting connections on {}.", tcp_local_addr);
+                                    }
                                 }
                                 Ok(false) => {}
                                 Err(e) => {
@@ -473,7 +498,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+                    // Check for finished or reset streams
+                    let active_streams: Vec<u64> = session.tcp_streams.keys().copied().collect();
+                    for stream_id in active_streams {
+                        let is_finished = session.conn.stream_finished(stream_id);
+                        let is_dead = session.opened_streams.contains(&stream_id)
+                            && session.conn.stream_capacity(stream_id).is_err();
+                        if is_finished || is_dead {
+                            debug!("QUIC stream {} finished or reset, closing local TCP stream", stream_id);
+                            session.close_tcp_stream_by_id(stream_id, &mut poll);
+                        }
+                    }
+
+                    let _ = session.flush_quic_to_udp(&udp_socket);
+                    debug!("tcp-to-quic UDP_TOKEN end stats: {:?}", session.conn.stats());
                 }
                 TCP_TOKEN => loop {
                     let (mut tcp_stream, address) = match tcp_server.accept() {
@@ -484,6 +522,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return Ok(());
                         }
                     };
+
+                    if !session.is_authenticated {
+                        debug!("Rejecting TCP connection from {} because QUIC tunnel is not authenticated", address);
+                        drop(tcp_stream);
+                        continue;
+                    }
 
                     optimize_tcp_stream(&tcp_stream);
                     info!("Accepted TCP connection from: {}", address);
@@ -521,7 +565,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tcp_closed = true;
                             }
                         }
-                        let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+                        let _ = session.flush_quic_to_udp(&udp_socket);
                     }
 
                     if event.is_readable() && !tcp_closed {
@@ -534,7 +578,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tcp_closed = true;
                             }
                         }
-                        let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+                        let _ = session.flush_quic_to_udp(&udp_socket);
                     }
 
                     if tcp_closed {
@@ -550,7 +594,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for stream_id in pending_ids {
             session.flush_pending_quic_write(stream_id);
         }
-        let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+        let _ = session.flush_quic_to_udp(&udp_socket);
     }
 }
 

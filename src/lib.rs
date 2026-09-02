@@ -24,6 +24,6 @@ pub use protocol::{
 pub use session::{FlushStatus, PartialWrite, Session, flush_quic_to_udp};
 pub use token::{mint_token, validate_token};
 pub use utils::{
-    hex_dump, interrupted, next_stream_id, next_token, normalize_socket_addr, optimize_tcp_stream,
-    optimize_udp_socket, would_block,
+    bind_tcp_listener, hex_dump, interrupted, next_stream_id, next_token, normalize_socket_addr,
+    optimize_tcp_stream, optimize_udp_socket, would_block,
 };

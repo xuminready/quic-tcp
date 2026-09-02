@@ -4,6 +4,7 @@ use mio::net::UdpSocket;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
+use std::net::SocketAddr;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FlushStatus {
@@ -25,8 +26,9 @@ pub fn is_disconnect_error(e: &io::Error) -> bool {
     )
 }
 
-pub const MAX_TCP_READ_PER_CALL: usize = 131072 * 16; // 2 MB max read per call
+const MAX_TCP_READ_PER_CALL: usize = 131072 * 16; // 2 MB per loop iteration to ensure fairness
 
+#[derive(Debug)]
 pub struct PartialWrite {
     pub data: Vec<u8>,
     pub written: usize,
@@ -35,7 +37,7 @@ pub struct PartialWrite {
 
 pub struct Session {
     pub conn: quiche::Connection,
-    /// Maps QUIC stream ID to the corresponding TCP stream.
+    /// Maps QUIC stream ID to mio TCP stream.
     pub tcp_streams: HashMap<u64, mio::net::TcpStream>,
     /// Maps mio Token of a TCP stream to the QUIC stream ID.
     pub token_to_stream_id: HashMap<mio::Token, u64>,
@@ -53,6 +55,10 @@ pub struct Session {
     pub is_authenticated: bool,
     pub auth_sent: bool,
     pub auth_verified: bool,
+    /// Streams that arrived before authentication was verified.
+    pub unauthenticated_readable_streams: HashSet<u64>,
+    /// Pending unsent UDP packet when send_to returned WouldBlock.
+    pub pending_udp_packet: Option<(Vec<u8>, SocketAddr)>,
 }
 
 impl Session {
@@ -69,6 +75,8 @@ impl Session {
             is_authenticated: false,
             auth_sent: false,
             auth_verified: false,
+            unauthenticated_readable_streams: HashSet::new(),
+            pending_udp_packet: None,
         }
     }
 
@@ -293,6 +301,14 @@ impl Session {
             return Ok(false);
         }
 
+        if !self.is_authenticated {
+            debug!(
+                "QUIC tunnel not yet authenticated, delaying TCP read for stream {}",
+                stream_id
+            );
+            return Ok(false);
+        }
+
         if self.quic_partial_writes.contains_key(&stream_id) {
             debug!("QUIC write buffer already pending for stream {}, delaying TCP read", stream_id);
             return Ok(false);
@@ -332,7 +348,7 @@ impl Session {
             };
 
             if capacity == 0 {
-                debug!("QUIC stream {} has 0 capacity", stream_id);
+                debug!("QUIC stream {} has 0 capacity! stats: {:?}", stream_id, self.conn.stats());
                 break 'read;
             }
 
@@ -636,13 +652,44 @@ impl Session {
         self.quic_read_done.remove(&stream_id);
         self.tcp_read_done.remove(&stream_id);
     }
+
+    /// Flushes outgoing QUIC packets using the session's pending packet buffer.
+    pub fn flush_quic_to_udp(&mut self, udp_socket: &UdpSocket) -> io::Result<bool> {
+        flush_quic_to_udp_internal(&mut self.conn, udp_socket, &mut self.pending_udp_packet)
+    }
 }
 
-/// Flushes outgoing QUIC packets to the UDP socket.
+/// Flushes outgoing QUIC packets to the UDP socket (compatibility wrapper).
 pub fn flush_quic_to_udp(
     conn: &mut quiche::Connection,
     udp_socket: &UdpSocket,
 ) -> io::Result<bool> {
+    let mut no_pending = None;
+    flush_quic_to_udp_internal(conn, udp_socket, &mut no_pending)
+}
+
+/// Flushes outgoing QUIC packets to the UDP socket, preserving unsent packets on WouldBlock.
+pub fn flush_quic_to_udp_internal(
+    conn: &mut quiche::Connection,
+    udp_socket: &UdpSocket,
+    pending_udp_packet: &mut Option<(Vec<u8>, SocketAddr)>,
+) -> io::Result<bool> {
+    // 1. Retry any unsent packet from a previous WouldBlock first
+    if let Some((pkt, target)) = pending_udp_packet.as_ref() {
+        match udp_socket.send_to(pkt, *target) {
+            Ok(_) => {
+                *pending_udp_packet = None;
+            }
+            Err(e) => {
+                if would_block(&e) {
+                    return Ok(conn.is_closed());
+                }
+                error!("UDP send failed for pending packet: {:?}", e);
+                return Err(e);
+            }
+        }
+    }
+
     let mut out = [0u8; 65535];
     loop {
         let (write, send_info) = match conn.send(&mut out) {
@@ -668,7 +715,8 @@ pub fn flush_quic_to_udp(
             }
             Err(e) => {
                 if would_block(&e) {
-                    debug!("UDP send would block");
+                    debug!("UDP send would block, buffering packet for retry");
+                    *pending_udp_packet = Some((out[..write].to_vec(), send_info.to));
                     break;
                 }
                 error!("UDP send failed: {:?}", e);

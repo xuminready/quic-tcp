@@ -35,6 +35,21 @@ pub fn optimize_tcp_stream(stream: &mio::net::TcpStream) {
     let _ = sock.set_send_buffer_size(2 * 1024 * 1024);
 }
 
+pub fn bind_tcp_listener(addr: SocketAddr) -> io::Result<mio::net::TcpListener> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    Ok(mio::net::TcpListener::from_std(std_listener))
+}
+
 pub fn next_stream_id(current: &mut u64) -> u64 {
     const MAX_STREAM_ID: u64 = (1 << 62) - 1;
     if *current == 0 {

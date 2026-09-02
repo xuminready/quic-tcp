@@ -256,7 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if session.conn.is_established() || session.conn.is_in_early_data() {
                     debug!("Sending periodic PING keepalive to maintain NAT mapping");
                     session.conn.send_ack_eliciting().ok();
-                    let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+                    let _ = session.flush_quic_to_udp(&udp_socket);
                 }
             }
             last_ping_time = Instant::now();
@@ -290,7 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+            let _ = session.flush_quic_to_udp(&udp_socket);
         }
 
         for event in events.iter() {
@@ -470,7 +470,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Process readable and writable streams for all active sessions after draining UDP
                     for session in sessions.values_mut() {
                         if session.conn.is_in_early_data() || session.conn.is_established() {
-                            for stream_id in session.conn.readable() {
+                            let mut readable_streams: Vec<u64> = session.conn.readable().collect();
+                            // Process Stream 0 authentication first if present
+                            if let Some(pos) = readable_streams.iter().position(|&s| s == 0) {
+                                readable_streams.remove(pos);
+                                readable_streams.insert(0, 0);
+                            }
+
+                            for stream_id in readable_streams {
                                 if stream_id == 0 {
                                     match session.process_server_auth(&tunnel_code, &mut peer_auth_filter) {
                                         Ok(true) => {
@@ -487,7 +494,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
 
                                 if !session.is_authenticated {
-                                    warn!("Stream {} received data before Stream 0 authentication completed. Dropping data.", stream_id);
+                                    debug!("Stream {} received data before Stream 0 authentication completed. Queuing.", stream_id);
+                                    session.unauthenticated_readable_streams.insert(stream_id);
                                     continue;
                                 }
 
@@ -501,6 +509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         Err(e) => {
                                             error!("Failed to connect to remote TCP server {}: {:?}", tcp_remote_addr, e);
                                             session.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0).ok();
+                                            session.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0).ok();
                                             continue;
                                         }
                                     };
@@ -528,6 +537,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
 
+                            // Process any previously queued streams once authenticated
+                            if session.is_authenticated && !session.unauthenticated_readable_streams.is_empty() {
+                                let pending: Vec<u64> = session.unauthenticated_readable_streams.drain().collect();
+                                for stream_id in pending {
+                                    session.opened_streams.insert(stream_id);
+                                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                                        session.tcp_streams.entry(stream_id)
+                                    {
+                                        let token = next_token(&mut unique_token);
+                                        let mut tcp_stream = match mio::net::TcpStream::connect(tcp_remote_addr) {
+                                            Ok(stream) => stream,
+                                            Err(e) => {
+                                                error!("Failed to connect to remote TCP server {}: {:?}", tcp_remote_addr, e);
+                                                session.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0).ok();
+                                                session.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0).ok();
+                                                continue;
+                                            }
+                                        };
+                                        optimize_tcp_stream(&tcp_stream);
+                                        poll.registry()
+                                            .register(
+                                                &mut tcp_stream,
+                                                token,
+                                                mio::Interest::READABLE.add(mio::Interest::WRITABLE),
+                                            )
+                                            .unwrap();
+                                        entry.insert(tcp_stream);
+                                        session.token_to_stream_id.insert(token, stream_id);
+
+                                        let scid = quiche::ConnectionId::from_vec(session.conn.source_id().as_ref().to_vec());
+                                        token_scid_map.insert(token, scid);
+                                    }
+
+                                    if let Err(e) = session.forward_quic_to_tcp(stream_id, &mut poll) {
+                                        if !quic_tcp::session::is_disconnect_error(&e) {
+                                            warn!("forward_quic_to_tcp error for stream {}: {:?}", stream_id, e);
+                                        }
+                                        session.close_tcp_stream_by_id(stream_id, &mut poll);
+                                        token_scid_map.retain(|tok, _| session.token_to_stream_id.contains_key(tok));
+                                    }
+                                }
+                            }
+
                             for stream_id in session.conn.writable() {
                                 session.flush_pending_quic_write(stream_id);
                                 if session.tcp_streams.contains_key(&stream_id) {
@@ -539,11 +591,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             }
+
+                            // Check for finished or reset streams
+                            let active_streams: Vec<u64> = session.tcp_streams.keys().copied().collect();
+                            for stream_id in active_streams {
+                                let is_finished = session.conn.stream_finished(stream_id);
+                                let is_dead = session.opened_streams.contains(&stream_id)
+                                    && session.conn.stream_capacity(stream_id).is_err();
+                                if is_finished || is_dead {
+                                    debug!("QUIC stream {} finished or reset, closing remote TCP stream", stream_id);
+                                    session.close_tcp_stream_by_id(stream_id, &mut poll);
+                                    token_scid_map.retain(|tok, _| session.token_to_stream_id.contains_key(tok));
+                                }
+                            }
                         }
                     }
 
                     for session in sessions.values_mut() {
-                        let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+                        let _ = session.flush_quic_to_udp(&udp_socket);
                     }
                 }
                 token => {
@@ -565,7 +630,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tcp_closed = true;
                             }
                         }
-                        let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+                        let _ = session.flush_quic_to_udp(&udp_socket);
                     }
 
                     if event.is_readable() && !tcp_closed {
@@ -578,7 +643,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tcp_closed = true;
                             }
                         }
-                        let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+                        let _ = session.flush_quic_to_udp(&udp_socket);
                     }
 
                     if tcp_closed {
@@ -603,7 +668,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = session.forward_quic_to_tcp(stream_id, &mut poll);
                 }
             }
-            let _ = flush_quic_to_udp(&mut session.conn, &udp_socket);
+            let _ = session.flush_quic_to_udp(&udp_socket);
         }
 
         // Garbage collect closed connections
