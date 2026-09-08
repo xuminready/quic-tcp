@@ -57,7 +57,17 @@ pub fn perform_hole_punching(
                 3 => PeerProbe::new_ack_ack(passcode),
                 _ => unreachable!(),
             };
-            socket.send_to(probe_msg.as_bytes(), peer_addr)?;
+            match socket.send_to(probe_msg.as_bytes(), peer_addr) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::NetworkUnreachable || e.raw_os_error() == Some(101) => {
+                    error!(
+                        "[P2P Hole Punch ERROR] Peer address {} is network unreachable: {}",
+                        peer_addr, e
+                    );
+                    return Err(format!("Peer address {} is network unreachable (check routing)", peer_addr).into());
+                }
+                Err(e) => return Err(e.into()),
+            }
 
             debug!(
                 "[P2P Hole Punch] [Round {}/{} Probe #{}] Sent step {} to {}",
@@ -234,7 +244,27 @@ pub fn run_server_p2p_handshake(
     let mut reg_ok = false;
     for _ in 0..5 {
         let reg_msg = ServerReg::new_signed(&tunnel_id, tcp_port, "IDLE", tunnel_code);
-        socket.send_to(reg_msg.as_bytes(), rendezvous_addr)?;
+        match socket.send_to(reg_msg.as_bytes(), rendezvous_addr) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NetworkUnreachable || e.raw_os_error() == Some(101) => {
+                error!(
+                    "[P2P Server ERROR] Network is unreachable to Rendezvous Server {}. Please check your {} network connectivity and routing.",
+                    rendezvous_addr,
+                    if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                );
+                eprintln!(
+                    "[P2P Server ERROR] Network is unreachable to Rendezvous Server {}. Please check your {} network connectivity and routing.",
+                    rendezvous_addr,
+                    if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                );
+                return Err(format!(
+                    "Network is unreachable to Rendezvous Server {} (system has no active {} route)",
+                    rendezvous_addr,
+                    if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                ).into());
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         match socket.recv_from(&mut buf) {
             Ok((len, src)) if crate::utils::normalize_socket_addr(src) == rendezvous_addr => {
@@ -397,7 +427,27 @@ pub fn run_client_p2p_handshake(
 
         for _ in 0..5 {
             let conn_msg = ClientConn::new_signed(&tunnel_id, tunnel_code);
-            socket.send_to(conn_msg.as_bytes(), rendezvous_addr)?;
+            match socket.send_to(conn_msg.as_bytes(), rendezvous_addr) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NetworkUnreachable || e.raw_os_error() == Some(101) => {
+                    error!(
+                        "[P2P Client ERROR] Network is unreachable to Rendezvous Server {}. Please check your {} network connectivity and routing.",
+                        rendezvous_addr,
+                        if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                    );
+                    eprintln!(
+                        "[P2P Client ERROR] Network is unreachable to Rendezvous Server {}. Please check your {} network connectivity and routing.",
+                        rendezvous_addr,
+                        if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                    );
+                    return Err(format!(
+                        "Network is unreachable to Rendezvous Server {} (system has no active {} route)",
+                        rendezvous_addr,
+                        if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                    ).into());
+                }
+                Err(e) => return Err(e.into()),
+            }
 
             match socket.recv_from(&mut buf) {
                 Ok((len, src)) if crate::utils::normalize_socket_addr(src) == rendezvous_addr => {
@@ -564,7 +614,22 @@ pub fn reconnect_client_p2p_handshake(
 
         for _ in 0..5 {
             let reset_msg = ClientReset::new_signed(&tunnel_id, tunnel_code);
-            socket.send_to(reset_msg.as_bytes(), rendezvous_addr)?;
+            match socket.send_to(reset_msg.as_bytes(), rendezvous_addr) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NetworkUnreachable || e.raw_os_error() == Some(101) => {
+                    error!(
+                        "[P2P Reconnect ERROR] Network is unreachable to Rendezvous Server {}. Please check your {} network connectivity and routing.",
+                        rendezvous_addr,
+                        if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                    );
+                    return Err(format!(
+                        "Network is unreachable to Rendezvous Server {} (system has no active {} route)",
+                        rendezvous_addr,
+                        if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                    ).into());
+                }
+                Err(e) => return Err(e.into()),
+            }
 
             match socket.recv_from(&mut buf) {
                 Ok((len, src)) if crate::utils::normalize_socket_addr(src) == rendezvous_addr => {

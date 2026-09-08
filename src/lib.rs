@@ -6,7 +6,7 @@ pub mod session;
 pub mod token;
 pub mod utils;
 
-pub const MAX_DATAGRAM_SIZE: usize = 1450;
+pub const MAX_DATAGRAM_SIZE: usize = 1200;
 pub const TCP_TOKEN: mio::Token = mio::Token(0);
 pub const UDP_TOKEN: mio::Token = mio::Token(1);
 

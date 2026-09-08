@@ -6,8 +6,12 @@ pub fn get_quic_config() -> quiche::Config {
     config
         .set_application_protos(&[b"hq-interop", b"hq-29", b"hq-28", b"hq-27", b"http/0.9"])
         .unwrap();
-    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    let datagram_size = std::env::var("QUIC_MAX_DATAGRAM_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(MAX_DATAGRAM_SIZE);
+    config.set_max_recv_udp_payload_size(datagram_size);
+    config.set_max_send_udp_payload_size(datagram_size);
     config.set_initial_max_data(1_000_000_000); // 1 GB initial data
     config.set_initial_max_stream_data_bidi_local(250_000_000); // 250 MB stream window
     config.set_initial_max_stream_data_bidi_remote(250_000_000);

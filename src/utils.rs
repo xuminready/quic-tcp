@@ -75,7 +75,9 @@ pub fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
                 let v4 = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
                 SocketAddr::new(IpAddr::V4(v4), v6.port())
             } else {
-                SocketAddr::V6(v6)
+                let is_link_local = octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80;
+                let scope_id = if is_link_local { v6.scope_id() } else { 0 };
+                SocketAddr::V6(std::net::SocketAddrV6::new(*v6.ip(), v6.port(), 0, scope_id))
             }
         }
         v4 => v4,
@@ -126,5 +128,32 @@ mod tests {
         // Native IPv6 remains unchanged
         let v6_addr: SocketAddr = "[2001:db8::1]:5759".parse().unwrap();
         assert_eq!(normalize_socket_addr(v6_addr), v6_addr);
+
+        // IPv6 with flowinfo set is normalized to flowinfo = 0
+        let v6_flowinfo = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "2001:db8::1".parse().unwrap(),
+            5759,
+            12345,
+            0,
+        ));
+        assert_eq!(normalize_socket_addr(v6_flowinfo), v6_addr);
+
+        // Global IPv6 with scope_id set is normalized to scope_id = 0
+        let v6_scope = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "2001:db8::1".parse().unwrap(),
+            5759,
+            0,
+            2,
+        ));
+        assert_eq!(normalize_socket_addr(v6_scope), v6_addr);
+
+        // Link-local IPv6 preserves its scope_id
+        let link_local = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            5759,
+            0,
+            2,
+        ));
+        assert_eq!(normalize_socket_addr(link_local), link_local);
     }
 }

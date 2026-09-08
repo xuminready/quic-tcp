@@ -82,6 +82,108 @@ flowchart TD
 
 ---
 
+## Multi-Server & Multi-Client Architecture
+
+The [`rendezvous-server`](src/bin/rendezvous_server.rs) acts as an out-of-band, stateless signaling registry for coordinating P2P NAT traversal. It does not relay proxy payload traffic; instead, it coordinates UDP hole punching so peers can establish direct peer-to-peer QUIC connections.
+
+### 1. In-Memory Registry & Tunnel Identification
+
+The Rendezvous Server maintains an in-memory hash map of all active server registrations:
+
+```rust
+struct RendezvousServer {
+    socket: UdpSocket,
+    servers: HashMap<String, ServerRecord>, // Key: 16-char hex tunnel_id
+    replay_filter: ReplayFilter,
+    peer_timeout: Duration,          // default 30s (RENDEZVOUS_PEER_TIMEOUT_SECS)
+    stale_cleanup_timeout: Duration, // default 120s (RENDEZVOUS_CLEANUP_TIMEOUT_SECS)
+}
+```
+
+- **Deterministic `tunnel_id`**: Derived via `SHA256(tunnel_code)[..8]`. Clients and servers only need to know the shared secret (`tunnel_code`) without needing to exchange dynamic IDs beforehand.
+- **`ServerRecord`**: Tracks the server's public NAT endpoint (`public_addr`), target TCP port, lifecycle status (`IDLE`, `BUSY`, or `OFFLINE`), secret code, currently connected client endpoint, and `last_seen` timestamp.
+
+---
+
+### 2. How Multiple Servers Are Supported
+
+Multiple backend servers ([`quic-to-tcp`](src/bin/quic_to_tcp.rs)) can register simultaneously with the same `rendezvous-server`:
+
+1. **Isolation by Secret Code**:
+   - Each server instance runs with its own secret code:
+     ```bash
+     # Server A (SSH forwarding)
+     quic-to-tcp p2p <Rendezvous_IP:Port> 127.0.0.1:22 "tunnel-ssh-secret"
+
+     # Server B (Web forwarding)
+     quic-to-tcp p2p <Rendezvous_IP:Port> 127.0.0.1:8080 "tunnel-web-secret"
+     ```
+   - Each secret derives a unique `tunnel_id`, allowing any number of servers to co-exist in the registry table.
+2. **Registration & Conflict Prevention**:
+   - Each server sends authenticated `REG <tunnel_id> <tcp_port> <status> <tunnel_code> <seq> <hmac>` messages.
+   - If an existing server re-registers with the same secret, its public endpoint and heartbeat timestamp are updated seamlessly.
+   - If a peer attempts to register an existing `tunnel_id` with a different secret, the rendezvous server rejects it (`ERR Server registration rejected: tunnel ID already registered with different secret`) to prevent tunnel hijacking.
+3. **Liveness & Automated Garbage Collection**:
+   - Servers send heartbeats (`STATUS` or `REG`) every 10 seconds.
+   - If a server stops responding for >30s (`peer_timeout`), it is marked `OFFLINE`.
+   - If inactive for >120s (`stale_cleanup_timeout`), its record is purged from memory.
+
+---
+
+### 3. How Multiple Clients Are Supported
+
+#### A. Multiple Clients to Different Tunnels (Fully Concurrent)
+- Multiple clients connecting to different services can request connections simultaneously:
+  ```bash
+  # Client 1 connects to SSH tunnel
+  tcp-to-quic p2p <Rendezvous_IP:Port> 127.0.0.1:2222 "tunnel-ssh-secret"
+
+  # Client 2 connects to Web tunnel
+  tcp-to-quic p2p <Rendezvous_IP:Port> 127.0.0.1:8080 "tunnel-web-secret"
+  ```
+- The rendezvous server matches each client by `tunnel_id`, validates the HMAC, and dispatches paired `PUNCH` signals to the corresponding server and client independently.
+
+#### B. Multiple Clients to the Same Tunnel (1:1 Active P2P Session Rule)
+- When a client connects to a tunnel, the rendezvous server marks that tunnel as **`BUSY`**:
+  ```rust
+  target_record.status = "BUSY".to_string();
+  target_record.connected_client = Some(src);
+  ```
+- If a second client attempts to issue `CONN` to the **same** `tunnel_id` while it is `BUSY`, the rendezvous server explicitly rejects it:
+  ```
+  ERR Tunnel <id> is currently BUSY and already connected to another client
+  ```
+- When the active client disconnects or the session is reset, the server reports back `STATUS <tunnel_id> IDLE`, freeing the tunnel for subsequent clients.
+
+---
+
+### 4. Multiplexing Multiple TCP Connections over One Tunnel
+
+Although each tunnel pairs with **one active `tcp-to-quic` client process at a time**, that single client supports **unlimited concurrent TCP application connections**:
+
+```
+[Local App 1] ──\
+[Local App 2] ─── TCP ──> [tcp-to-quic] === single QUIC tunnel ===> [quic-to-tcp] ── TCP ──> [Target Daemon]
+[Local App 3] ──/           (Client)       (Streams 4, 8, 12...)       (Server)
+```
+
+- **QUIC Stream Multiplexing**: Every time a local application connects to `tcp-to-quic`'s local TCP port, an independent QUIC stream ID (4, 8, 12, ...) is opened over the established peer-to-peer UDP connection.
+- All streams share the single direct QUIC connection without incurring additional rendezvous handshakes or NAT traversal overhead.
+
+---
+
+### 5. Summary Matrix
+
+| Scenario | Supported? | Mechanism / Behavior |
+| :--- | :---: | :--- |
+| **Multiple servers on 1 Rendezvous** | **Yes** | Each server uses a different secret code / `tunnel_id`. Keyed in `HashMap<String, ServerRecord>`. |
+| **Multiple clients to different servers** | **Yes** | Fully concurrent. Rendezvous coordinates hole punching for each pair independently. |
+| **Multiple clients to the same server** | **Sequential only** | A tunnel becomes `BUSY` when connected. Additional clients are rejected until the tunnel returns to `IDLE`. |
+| **Multiple TCP sockets over 1 client tunnel** | **Yes** | Multiplexed into independent QUIC streams (streams 4, 8, 12...) over the active P2P link. |
+| **IPv4 & IPv6 coexistence** | **Yes** | Multiple IPv4 and IPv6 servers can register, but client and server of a given tunnel must share the same IP family. |
+
+---
+
 ## Build Instructions
 
 ### Build Prerequisites
@@ -268,6 +370,7 @@ RUST_LOG=info cargo run --release --bin tcp-to-quic p2p [2001:db8::100]:5050 [::
 - **Bracket Notation**: All IPv6 addresses should be enclosed in brackets with their port, e.g. `[::1]:8080`, `[2001:db8::1]:4433`, or `[::]:7070`.
 - **Automatic Socket Family Detection**: In P2P mode, both `quic-to-tcp` and `tcp-to-quic` inspect the Rendezvous address and automatically bind their underlying UDP socket to `[::]:0` for IPv6 or `0.0.0.0:0` for IPv4.
 - **Firewall Traversal on IPv6**: Because IPv6 typically uses stateful firewalls without address translation (no CGNAT/Symmetric NAT), the 3-way UDP hole-punching protocol (`PEER_PUNCH`) opens inbound firewall pinholes with 100% reliability.
+- **Path MTU & Safe Datagram Size**: QUIC uses a default `MAX_DATAGRAM_SIZE = 1200` bytes (RFC 9000 standard). This prevents packet drops on networks with reduced MTU, such as Google Cloud Platform VPC (MTU 1460), WireGuard (MTU 1420), PPPoE (MTU 1492), or minimum IPv6 MTU (1280). Can be tuned via `QUIC_MAX_DATAGRAM_SIZE` env var if on a jumbo-frame LAN.
 
 ---
 
@@ -276,6 +379,7 @@ RUST_LOG=info cargo run --release --bin tcp-to-quic p2p [2001:db8::100]:5050 [::
 Run the built-in throughput benchmark suite:
 ```bash
 python3 test_throughput.py
+python3 test_throughput_ipv6.py
 ```
 
 Typical performance on local/LAN benchmarks:
@@ -297,7 +401,7 @@ openssl req -x509 -newkey rsa:2048 -keyout cert.key -out cert.crt -days 365 -nod
 
 ## Project Structure
 
-- [`src/lib.rs`](src/lib.rs): Core module re-exports and constants (`MAX_DATAGRAM_SIZE = 1450`).
+- [`src/lib.rs`](src/lib.rs): Core module re-exports and constants (`MAX_DATAGRAM_SIZE = 1200`).
 - [`src/auth.rs`](src/auth.rs): `derive_tunnel_id`, HMAC-SHA256 signing/verification, atomic timestamp sequence generation, and memory-bounded `ReplayFilter`.
 - [`src/protocol.rs`](src/protocol.rs): Control message definitions (`ServerReg`, `RegOk`, `ServerStatusMsg`, `ClientConn`, `ClientReset`, `PunchSignal`, `PeerProbe`).
 - [`src/p2p.rs`](src/p2p.rs): P2P handshake orchestration, 3-way UDP hole punching, keepalive signaling, and automatic reconnection handling.
