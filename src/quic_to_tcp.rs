@@ -78,6 +78,16 @@ impl ServerMode {
                 return Err("Missing required P2P arguments. Expected: p2p <Rendezvous_IP:Port> <Remote_TCP_IP:Port> [Code]".to_string());
             }
             if args.len() > 5 {
+                if let Some(pos) = args[4..].iter().rposition(|a| a == "p2p" || a == "direct") {
+                    let tail_start = 4 + pos;
+                    let mut clean_args = vec![args[0].clone()];
+                    clean_args.extend_from_slice(&args[tail_start..]);
+                    warn!(
+                        "Detected duplicated command on CLI; using trailing arguments: {:?}",
+                        &clean_args[1..]
+                    );
+                    return Self::from_args(&clean_args);
+                }
                 return Err(format!(
                     "Unexpected extra arguments after Secret_Code: {:?}. (Check if a command was pasted twice or if '!' triggered shell history expansion)",
                     &args[5..]
