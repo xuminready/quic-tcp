@@ -8,9 +8,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let mode = match ClientMode::from_args(&args) {
         Ok(m) => m,
-        Err(_) => {
+        Err(e) => {
+            eprintln!("Error: {}\n", e);
             print_usage(&args[0]);
-            return Ok(());
+            std::process::exit(1);
         }
     };
 

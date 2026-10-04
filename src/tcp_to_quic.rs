@@ -63,6 +63,12 @@ impl ClientMode {
             if args.len() < 4 {
                 return Err("Missing required P2P arguments. Expected: p2p <Rendezvous_IP:Port> <Local_TCP_IP:Port> [Code]".to_string());
             }
+            if args.len() > 5 {
+                return Err(format!(
+                    "Unexpected extra arguments after Secret_Code: {:?}. (Check if a command was pasted twice or if '!' triggered shell history expansion)",
+                    &args[5..]
+                ));
+            }
 
             let rendezvous_addr: SocketAddr = args[2]
                 .parse()
@@ -87,6 +93,12 @@ impl ClientMode {
             let offset = if args[1] == "direct" { 1 } else { 0 };
             if args.len() < 3 + offset {
                 return Err("Missing required Direct Mode arguments. Expected: [direct] <Local_TCP_IP:Port> <Remote_UDP_IP:Port> [Code]".to_string());
+            }
+            if args.len() > 4 + offset {
+                return Err(format!(
+                    "Unexpected extra arguments after Secret_Code: {:?}. (Check if a command was pasted twice or if '!' triggered shell history expansion)",
+                    &args[(4 + offset)..]
+                ));
             }
             let local_tcp_addr: SocketAddr = args[1 + offset]
                 .parse()
@@ -160,8 +172,8 @@ pub fn run_tcp_to_quic(mode: ClientMode) -> Result<(), Box<dyn std::error::Error
         } => {
             tunnel_code = code.clone();
             info!(
-                "[tcp-to-quic] P2P Mode: connecting to Rendezvous Server {}, Local TCP Listener: {}",
-                rendezvous_addr, local_tcp_addr
+                "[tcp-to-quic] P2P Mode: connecting to Rendezvous Server {}, Local TCP Listener: {}, Secret: {:?}",
+                rendezvous_addr, local_tcp_addr, tunnel_code
             );
             println!(
                 "P2P Mode: connecting to Rendezvous Server {} with secret code",
