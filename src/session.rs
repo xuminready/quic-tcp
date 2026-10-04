@@ -93,6 +93,16 @@ impl Session {
         }
     }
 
+    /// Sends an authenticated release message on stream 0 and closes the QUIC connection.
+    pub fn send_release_packet(&mut self, passcode: &str) {
+        if !self.conn.is_closed() && (self.conn.is_established() || self.conn.is_in_early_data()) {
+            let msg = format!("{}\n", crate::protocol::PeerRelease::new_signed(passcode));
+            let _ = self.conn.stream_send(0, msg.as_bytes(), true);
+            let _ = self.conn.close(true, 0x00, b"client_release");
+            debug!("[Session] Sent PEER_RELEASE on stream 0 and closed QUIC connection");
+        }
+    }
+
     /// Handles auth frame on stream 0 for server side.
     /// Returns Ok(true) if newly authenticated, Ok(false) if still waiting, or Err if auth failed/replayed.
     pub fn process_server_auth(
@@ -111,14 +121,31 @@ impl Session {
                     let payload = format!("AUTH:{}", seq);
 
                     if !replay_filter.check_and_add(seq) {
-                        let _ = self.conn.stream_send(0, b"ERR Replay attack detected: duplicate or stale sequence number\n", true);
+                        let _ = self.conn.stream_send(
+                            0,
+                            b"ERR Replay attack detected: duplicate or stale sequence number\n",
+                            true,
+                        );
                         self.conn.close(true, 0x02, b"Replay attack detected").ok();
-                        return Err(format!("Replay attack detected: duplicate or stale sequence number {}", seq));
+                        return Err(format!(
+                            "Replay attack detected: duplicate or stale sequence number {}",
+                            seq
+                        ));
                     }
 
                     if !crate::auth::verify_auth(passcode, &payload, hmac) {
-                        let _ = self.conn.stream_send(0, b"ERR Authentication failed: invalid server passcode\n", true);
-                        self.conn.close(true, 0x01, b"Authentication failed: invalid server passcode").ok();
+                        let _ = self.conn.stream_send(
+                            0,
+                            b"ERR Authentication failed: invalid server passcode\n",
+                            true,
+                        );
+                        self.conn
+                            .close(
+                                true,
+                                0x01,
+                                b"Authentication failed: invalid server passcode",
+                            )
+                            .ok();
                         return Err("Authentication failed: invalid server passcode".to_string());
                     }
 
@@ -129,12 +156,30 @@ impl Session {
                     let resp_hmac = crate::auth::compute_auth(passcode, &resp_payload);
                     let resp_msg = format!("AUTH_OK {} {}\n", resp_seq, resp_hmac);
                     self.conn.stream_send(0, resp_msg.as_bytes(), false).ok();
-                    debug!("[Session] Server authenticated client on stream 0 (seq={})", seq);
+                    debug!(
+                        "[Session] Server authenticated client on stream 0 (seq={})",
+                        seq
+                    );
                     Ok(true)
+                } else if let Some(release) = crate::protocol::PeerRelease::parse(msg) {
+                    if release.verify(passcode) && replay_filter.check_and_add(release.seq) {
+                        debug!(
+                            "[Session] Received PEER_RELEASE on stream 0 (seq={}). Closing session.",
+                            release.seq
+                        );
+                        self.conn.close(true, 0x00, b"client_release").ok();
+                        Ok(false)
+                    } else {
+                        Err("Invalid or replayed PEER_RELEASE on stream 0".to_string())
+                    }
                 } else {
                     let err = format!("Invalid auth packet format on stream 0: {}", msg);
-                    let _ = self.conn.stream_send(0, b"ERR Invalid auth packet format\n", true);
-                    self.conn.close(true, 0x03, b"Invalid auth packet format").ok();
+                    let _ = self
+                        .conn
+                        .stream_send(0, b"ERR Invalid auth packet format\n", true);
+                    self.conn
+                        .close(true, 0x03, b"Invalid auth packet format")
+                        .ok();
                     Err(err)
                 }
             }
@@ -167,7 +212,13 @@ impl Session {
                     }
 
                     if !crate::auth::verify_auth(passcode, &payload, hmac) {
-                        self.conn.close(true, 0x01, b"Authentication failed: invalid server passcode").ok();
+                        self.conn
+                            .close(
+                                true,
+                                0x01,
+                                b"Authentication failed: invalid server passcode",
+                            )
+                            .ok();
                         return Err("Server auth reply HMAC invalid".to_string());
                     }
 
@@ -176,7 +227,9 @@ impl Session {
                     debug!("[Session] Client verified server on stream 0 (seq={})", seq);
                     Ok(true)
                 } else if parts.len() >= 2 && parts[0] == "ERR" {
-                    self.conn.close(true, 0x01, b"Authentication rejected by server").ok();
+                    self.conn
+                        .close(true, 0x01, b"Authentication rejected by server")
+                        .ok();
                     Err(format!("Server rejected authentication: {}", msg))
                 } else {
                     Err(format!("Unexpected message on auth stream 0: {}", msg))
@@ -310,7 +363,10 @@ impl Session {
         }
 
         if self.quic_partial_writes.contains_key(&stream_id) {
-            debug!("QUIC write buffer already pending for stream {}, delaying TCP read", stream_id);
+            debug!(
+                "QUIC write buffer already pending for stream {}, delaying TCP read",
+                stream_id
+            );
             return Ok(false);
         }
 
@@ -348,7 +404,11 @@ impl Session {
             };
 
             if capacity == 0 {
-                debug!("QUIC stream {} has 0 capacity! stats: {:?}", stream_id, self.conn.stats());
+                debug!(
+                    "QUIC stream {} has 0 capacity! stats: {:?}",
+                    stream_id,
+                    self.conn.stats()
+                );
                 break 'read;
             }
 
@@ -431,9 +491,15 @@ impl Session {
                     } else {
                         warn!("TCP read failed on stream {}: {:?}", stream_id, e);
                     }
-                    debug!("TCP client disconnected, informing peer via QUIC reset & dropping buffered data");
-                    let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
-                    let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+                    debug!(
+                        "TCP client disconnected, informing peer via QUIC reset & dropping buffered data"
+                    );
+                    let _ = self
+                        .conn
+                        .stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+                    let _ = self
+                        .conn
+                        .stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
                     self.close_tcp_stream_internal(stream_id, poll);
                     return Ok(true);
                 }
@@ -570,8 +636,14 @@ impl Session {
                                 } else {
                                     warn!("TCP write failed on stream {}: {:?}", stream_id, e);
                                 }
-                                let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
-                                let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+                                let _ =
+                                    self.conn
+                                        .stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+                                let _ = self.conn.stream_shutdown(
+                                    stream_id,
+                                    quiche::Shutdown::Write,
+                                    0,
+                                );
                                 self.close_tcp_stream_internal(stream_id, poll);
                                 return Ok(true);
                             }
@@ -643,8 +715,12 @@ impl Session {
         if let Some(mut tcp_stream) = self.tcp_streams.remove(&stream_id) {
             poll.registry().deregister(&mut tcp_stream).ok();
         }
-        let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
-        let _ = self.conn.stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
+        let _ = self
+            .conn
+            .stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+        let _ = self
+            .conn
+            .stream_shutdown(stream_id, quiche::Shutdown::Write, 0);
         self.token_to_stream_id.retain(|_, &mut v| v != stream_id);
         self.quic_partial_writes.remove(&stream_id);
         self.tcp_partial_writes.remove(&stream_id);

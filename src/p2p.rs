@@ -3,9 +3,10 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-pub use crate::auth::{compute_auth, derive_tunnel_id, next_seq, verify_auth, ReplayFilter};
+pub use crate::auth::{ReplayFilter, compute_auth, derive_tunnel_id, next_seq, verify_auth};
 use crate::protocol::{
-    ClientConn, ClientReset, PeerProbe, PunchSignal, RegOk, ServerReg, ServerStatusMsg,
+    ClientConn, ClientReset, PeerProbe, PeerRelease, PeerReleaseAck, PunchSignal, RegOk, ServerReg,
+    ServerStatusMsg,
 };
 
 /// Performs UDP hole punching between two peers with multi-round retries, progress logging, and replay-protected HMAC authentication.
@@ -37,6 +38,9 @@ pub fn perform_hole_punching(
     );
 
     for round in 1..=max_rounds {
+        if crate::utils::is_shutdown_requested() {
+            return Err("Shutdown requested".into());
+        }
         let mut punched = false;
         let mut ack_ack_sends = 0;
         let mut current_step = 1; // 1: PEER_PUNCH, 2: PEER_PUNCH_ACK, 3: PEER_PUNCH_ACK_ACK
@@ -51,6 +55,9 @@ pub fn perform_hole_punching(
         );
 
         for attempt in 1..=attempts_per_round {
+            if crate::utils::is_shutdown_requested() {
+                return Err("Shutdown requested".into());
+            }
             let probe_msg = match current_step {
                 1 => PeerProbe::new_punch(passcode),
                 2 => PeerProbe::new_ack(passcode),
@@ -59,12 +66,19 @@ pub fn perform_hole_punching(
             };
             match socket.send_to(probe_msg.as_bytes(), peer_addr) {
                 Ok(_) => {}
-                Err(ref e) if e.kind() == io::ErrorKind::NetworkUnreachable || e.raw_os_error() == Some(101) => {
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::NetworkUnreachable
+                        || e.raw_os_error() == Some(101) =>
+                {
                     error!(
                         "[P2P Hole Punch ERROR] Peer address {} is network unreachable: {}",
                         peer_addr, e
                     );
-                    return Err(format!("Peer address {} is network unreachable (check routing)", peer_addr).into());
+                    return Err(format!(
+                        "Peer address {} is network unreachable (check routing)",
+                        peer_addr
+                    )
+                    .into());
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -88,13 +102,17 @@ pub fn perform_hole_punching(
                     if src.ip() == peer_addr.ip() {
                         if let Some(probe) = PeerProbe::parse(text) {
                             if !probe.verify(passcode) {
-                                debug!("[P2P Hole Punch] Dropping probe with invalid HMAC from {}", src);
+                                debug!(
+                                    "[P2P Hole Punch] Dropping probe with invalid HMAC from {}",
+                                    src
+                                );
                                 continue;
                             }
                             if !replay_filter.check_and_add(probe.seq()) {
                                 debug!(
                                     "[P2P Hole Punch] Dropping replayed probe with seq {} from {}",
-                                    probe.seq(), src
+                                    probe.seq(),
+                                    src
                                 );
                                 continue;
                             }
@@ -117,7 +135,7 @@ pub fn perform_hole_punching(
                                     info!(
                                         "[P2P Hole Punch] [Progress: Round {}/{}] STEP 2/3: Received PEER_PUNCH_ACK from {}. Bidirectional NAT mapping confirmed! Replying with PEER_PUNCH_ACK_ACK.",
                                         round, max_rounds, src
-                                        );
+                                    );
                                     println!(
                                         "[P2P Hole Punch] [Progress: Round {}/{}] STEP 2/3: Received PEER_PUNCH_ACK from {}. Bidirectional NAT mapping confirmed! Replying with PEER_PUNCH_ACK_ACK.",
                                         round, max_rounds, src
@@ -167,9 +185,10 @@ pub fn perform_hole_punching(
                 }
                 Err(ref e)
                     if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
+                        || e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::Interrupted =>
                 {
-                    // Expected read timeout between probes
+                    // Expected read timeout or signal between probes
                 }
                 Err(e) => {
                     debug!("[P2P Hole Punch] recv error: {}", e);
@@ -193,11 +212,19 @@ pub fn perform_hole_punching(
         if round < max_rounds {
             warn!(
                 "[P2P Hole Punch] Round {}/{} timed out without confirming bidirectional path with {}. Retrying Round {}/{}...",
-                round, max_rounds, peer_addr, round + 1, max_rounds
+                round,
+                max_rounds,
+                peer_addr,
+                round + 1,
+                max_rounds
             );
             println!(
                 "[P2P Hole Punch] Round {}/{} timed out without confirming bidirectional path with {}. Retrying Round {}/{}...",
-                round, max_rounds, peer_addr, round + 1, max_rounds
+                round,
+                max_rounds,
+                peer_addr,
+                round + 1,
+                max_rounds
             );
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -235,27 +262,46 @@ pub fn run_server_p2p_handshake(
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
 
     let mut buf = [0; 1024];
+    let mut rdv_replay_filter = ReplayFilter::new();
 
     // 1. Register with Rendezvous Server using tunnel_code
+    info!(
+        "Registering at Rendezvous Server {} (Tunnel ID: {}, Target Port: {}, Status: IDLE)...",
+        rendezvous_addr, tunnel_id, tcp_port
+    );
     println!(
         "Registering at Rendezvous Server {} (Tunnel ID: {}, Target Port: {}, Status: IDLE)...",
         rendezvous_addr, tunnel_id, tcp_port
     );
     let mut reg_ok = false;
     for _ in 0..5 {
+        if crate::utils::is_shutdown_requested() {
+            return Err("Shutdown requested".into());
+        }
         let reg_msg = ServerReg::new_signed(&tunnel_id, tcp_port, "IDLE", tunnel_code);
         match socket.send_to(reg_msg.as_bytes(), rendezvous_addr) {
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NetworkUnreachable || e.raw_os_error() == Some(101) => {
+            Err(e)
+                if e.kind() == io::ErrorKind::NetworkUnreachable
+                    || e.raw_os_error() == Some(101) =>
+            {
                 error!(
                     "[P2P Server ERROR] Network is unreachable to Rendezvous Server {}. Please check your {} network connectivity and routing.",
                     rendezvous_addr,
-                    if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                    if rendezvous_addr.is_ipv6() {
+                        "IPv6"
+                    } else {
+                        "IPv4"
+                    }
                 );
                 eprintln!(
                     "[P2P Server ERROR] Network is unreachable to Rendezvous Server {}. Please check your {} network connectivity and routing.",
                     rendezvous_addr,
-                    if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                    if rendezvous_addr.is_ipv6() {
+                        "IPv6"
+                    } else {
+                        "IPv4"
+                    }
                 );
                 return Err(format!(
                     "Network is unreachable to Rendezvous Server {} (system has no active {} route)",
@@ -270,14 +316,18 @@ pub fn run_server_p2p_handshake(
             Ok((len, src)) if crate::utils::normalize_socket_addr(src) == rendezvous_addr => {
                 let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                 if let Some(ok) = RegOk::parse(reply) {
-                    if ok.verify(tunnel_code) {
+                    if ok.verify(tunnel_code) && rdv_replay_filter.check_and_add(ok.seq) {
                         reg_ok = true;
                         break;
                     } else {
-                        return Err("Authentication failed on REG_OK reply from Rendezvous Server".into());
+                        return Err(
+                            "Authentication failed on REG_OK reply from Rendezvous Server".into(),
+                        );
                     }
                 } else if reply.starts_with("ERR") {
-                    return Err(format!("Rendezvous Server rejected registration: {}", reply).into());
+                    return Err(
+                        format!("Rendezvous Server rejected registration: {}", reply).into(),
+                    );
                 }
             }
             _ => {}
@@ -297,38 +347,61 @@ pub fn run_server_p2p_handshake(
     }
     // 2. Wait for authenticated PUNCH signal from Rendezvous Server & perform hole punching
     let _final_peer_addr = loop {
-        socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+        socket.set_read_timeout(Some(Duration::from_millis(250)))?;
+        info!("Waiting for peer connection (sending authenticated keep-alives every 10s)...");
         println!("Waiting for peer connection (sending authenticated keep-alives every 10s)...");
+        let mut last_keepalive = std::time::Instant::now();
         let peer_addr = loop {
+            if crate::utils::is_shutdown_requested() {
+                return Err("Shutdown requested".into());
+            }
             match socket.recv_from(&mut buf) {
                 Ok((len, src)) if crate::utils::normalize_socket_addr(src) == rendezvous_addr => {
                     let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                     if let Some(signal) = PunchSignal::parse(reply) {
-                        if signal.verify(tunnel_code) {
+                        if signal.verify(tunnel_code)
+                            && rdv_replay_filter.check_and_add(signal.seq())
+                        {
                             if let PunchSignal::Passive { client_addr, .. } = signal {
                                 break client_addr;
                             }
                         } else {
-                            warn!("Received unauthenticated PUNCH packet from Rendezvous Server, dropping.");
+                            warn!(
+                                "Received unauthenticated or replayed PUNCH packet from Rendezvous Server, dropping."
+                            );
                         }
                     }
                 }
                 Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::Interrupted =>
                 {
-                    // Timeout, send authenticated keep-alive
-                    let _ = send_server_keepalive(
-                        &socket,
-                        rendezvous_addr,
-                        &tunnel_id,
-                        tcp_port,
-                        "IDLE",
-                        tunnel_code,
-                    );
+                    if crate::utils::is_shutdown_requested() {
+                        return Err("Shutdown requested".into());
+                    }
+                    if last_keepalive.elapsed() >= Duration::from_secs(10) {
+                        // Send authenticated keep-alive every 10s
+                        let _ = send_server_keepalive(
+                            &socket,
+                            rendezvous_addr,
+                            &tunnel_id,
+                            tcp_port,
+                            "IDLE",
+                            tunnel_code,
+                        );
+                        last_keepalive = std::time::Instant::now();
+                    }
                 }
                 Err(e) => {
-                    error!("[P2P Server ERROR] Socket error while waiting for connection: {}. Giving up.", e);
-                    eprintln!("[P2P Server ERROR] Socket error while waiting for connection: {}. Giving up.", e);
+                    error!(
+                        "[P2P Server ERROR] Socket error while waiting for connection: {}. Giving up.",
+                        e
+                    );
+                    eprintln!(
+                        "[P2P Server ERROR] Socket error while waiting for connection: {}. Giving up.",
+                        e
+                    );
                     return Err(e.into());
                 }
                 _ => {}
@@ -358,6 +431,9 @@ pub fn run_server_p2p_handshake(
                 break addr;
             }
             Err(e) => {
+                if crate::utils::is_shutdown_requested() {
+                    return Err(e);
+                }
                 warn!(
                     "[P2P Server] Hole punching failed with client {}: {}. Starting over and re-registering as IDLE at Rendezvous Server...",
                     peer_addr, e
@@ -392,8 +468,12 @@ pub fn run_client_p2p_handshake(
     let rendezvous_addr = crate::utils::normalize_socket_addr(rendezvous_addr);
     let tunnel_id = derive_tunnel_id(tunnel_code);
     let max_handshake_attempts = 3;
+    let mut rdv_replay_filter = ReplayFilter::new();
 
     for attempt in 1..=max_handshake_attempts {
+        if crate::utils::is_shutdown_requested() {
+            return Err("Shutdown requested".into());
+        }
         info!(
             "[P2P Client] Handshake attempt {}/{}: Connecting to Rendezvous Server {} for Tunnel ID {}...",
             attempt, max_handshake_attempts, rendezvous_addr, tunnel_id
@@ -411,8 +491,14 @@ pub fn run_client_p2p_handshake(
             Ok(s) => s,
             Err(e) => {
                 if attempt == max_handshake_attempts {
-                    error!("[P2P Client ERROR] Failed to bind local UDP socket: {}. Giving up.", e);
-                    eprintln!("[P2P Client ERROR] Failed to bind local UDP socket: {}. Giving up.", e);
+                    error!(
+                        "[P2P Client ERROR] Failed to bind local UDP socket: {}. Giving up.",
+                        e
+                    );
+                    eprintln!(
+                        "[P2P Client ERROR] Failed to bind local UDP socket: {}. Giving up.",
+                        e
+                    );
                     return Err(e.into());
                 }
                 std::thread::sleep(Duration::from_millis(500));
@@ -426,19 +512,33 @@ pub fn run_client_p2p_handshake(
         let mut last_err = String::new();
 
         for _ in 0..5 {
+            if crate::utils::is_shutdown_requested() {
+                return Err("Shutdown requested".into());
+            }
             let conn_msg = ClientConn::new_signed(&tunnel_id, tunnel_code);
             match socket.send_to(conn_msg.as_bytes(), rendezvous_addr) {
                 Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NetworkUnreachable || e.raw_os_error() == Some(101) => {
+                Err(e)
+                    if e.kind() == io::ErrorKind::NetworkUnreachable
+                        || e.raw_os_error() == Some(101) =>
+                {
                     error!(
                         "[P2P Client ERROR] Network is unreachable to Rendezvous Server {}. Please check your {} network connectivity and routing.",
                         rendezvous_addr,
-                        if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                        if rendezvous_addr.is_ipv6() {
+                            "IPv6"
+                        } else {
+                            "IPv4"
+                        }
                     );
                     eprintln!(
                         "[P2P Client ERROR] Network is unreachable to Rendezvous Server {}. Please check your {} network connectivity and routing.",
                         rendezvous_addr,
-                        if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                        if rendezvous_addr.is_ipv6() {
+                            "IPv6"
+                        } else {
+                            "IPv4"
+                        }
                     );
                     return Err(format!(
                         "Network is unreachable to Rendezvous Server {} (system has no active {} route)",
@@ -453,7 +553,9 @@ pub fn run_client_p2p_handshake(
                 Ok((len, src)) if crate::utils::normalize_socket_addr(src) == rendezvous_addr => {
                     let reply = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
                     if let Some(signal) = PunchSignal::parse(reply) {
-                        if signal.verify(tunnel_code) {
+                        if signal.verify(tunnel_code)
+                            && rdv_replay_filter.check_and_add(signal.seq())
+                        {
                             if let PunchSignal::Active { server_addr, .. } = signal {
                                 peer_addr = Some(server_addr);
                                 break;
@@ -461,11 +563,26 @@ pub fn run_client_p2p_handshake(
                         }
                     } else if reply.starts_with("ERR") {
                         last_err = reply.to_string();
-                        warn!("[P2P Client] Rendezvous Server rejected connection: {}", reply);
-                        println!("[P2P Client] Rendezvous Server rejected connection: {}", reply);
-                        if reply.contains("Authentication failed") || reply.contains("No server registered") || reply.contains("IP address family mismatch") {
-                            error!("[P2P Client ERROR] Connection rejected: {}. Giving up.", reply);
-                            eprintln!("[P2P Client ERROR] Connection rejected: {}. Giving up.", reply);
+                        warn!(
+                            "[P2P Client] Rendezvous Server rejected connection: {}",
+                            reply
+                        );
+                        println!(
+                            "[P2P Client] Rendezvous Server rejected connection: {}",
+                            reply
+                        );
+                        if reply.contains("Authentication failed")
+                            || reply.contains("No server registered")
+                            || reply.contains("IP address family mismatch")
+                        {
+                            error!(
+                                "[P2P Client ERROR] Connection rejected: {}. Giving up.",
+                                reply
+                            );
+                            eprintln!(
+                                "[P2P Client ERROR] Connection rejected: {}. Giving up.",
+                                reply
+                            );
                             return Err(reply.into());
                         }
                         break;
@@ -478,37 +595,77 @@ pub fn run_client_p2p_handshake(
         let peer_addr = match peer_addr {
             Some(addr) => addr,
             None => {
-                if !last_err.is_empty() && (last_err.contains("Authentication failed") || last_err.contains("No server registered") || last_err.contains("IP address family mismatch")) {
+                if !last_err.is_empty()
+                    && (last_err.contains("Authentication failed")
+                        || last_err.contains("No server registered")
+                        || last_err.contains("IP address family mismatch"))
+                {
                     return Err(last_err.into());
                 }
                 if attempt < max_handshake_attempts {
                     warn!(
                         "[P2P Client] Attempt {}/{} timed out waiting for PUNCH signal from Rendezvous Server ({}). Retrying in 1s...",
-                        attempt, max_handshake_attempts, if last_err.is_empty() { "timeout" } else { &last_err }
+                        attempt,
+                        max_handshake_attempts,
+                        if last_err.is_empty() {
+                            "timeout"
+                        } else {
+                            &last_err
+                        }
                     );
                     println!(
                         "[P2P Client] Attempt {}/{} timed out waiting for PUNCH signal from Rendezvous Server ({}). Retrying in 1s...",
-                        attempt, max_handshake_attempts, if last_err.is_empty() { "timeout" } else { &last_err }
+                        attempt,
+                        max_handshake_attempts,
+                        if last_err.is_empty() {
+                            "timeout"
+                        } else {
+                            &last_err
+                        }
                     );
                     std::thread::sleep(Duration::from_secs(1));
                     continue;
                 } else {
                     error!(
                         "[P2P Client ERROR] Failed to connect via Rendezvous Server after {} attempts ({}). Giving up.",
-                        max_handshake_attempts, if last_err.is_empty() { "timeout" } else { &last_err }
+                        max_handshake_attempts,
+                        if last_err.is_empty() {
+                            "timeout"
+                        } else {
+                            &last_err
+                        }
                     );
                     eprintln!(
                         "[P2P Client ERROR] Failed to connect via Rendezvous Server after {} attempts ({}). Giving up.",
-                        max_handshake_attempts, if last_err.is_empty() { "timeout" } else { &last_err }
+                        max_handshake_attempts,
+                        if last_err.is_empty() {
+                            "timeout"
+                        } else {
+                            &last_err
+                        }
                     );
-                    return Err(format!("Failed to connect via Rendezvous Server: {}", if last_err.is_empty() { "timeout" } else { &last_err }).into());
+                    return Err(format!(
+                        "Failed to connect via Rendezvous Server: {}",
+                        if last_err.is_empty() {
+                            "timeout"
+                        } else {
+                            &last_err
+                        }
+                    )
+                    .into());
                 }
             }
         };
 
         // Hole Punching Phase with tunnel_code
-        info!("[P2P Client] Starting UDP hole punching to server endpoint {}...", peer_addr);
-        println!("[P2P Client] Starting UDP hole punching to server endpoint {}...", peer_addr);
+        info!(
+            "[P2P Client] Starting UDP hole punching to server endpoint {}...",
+            peer_addr
+        );
+        println!(
+            "[P2P Client] Starting UDP hole punching to server endpoint {}...",
+            peer_addr
+        );
         match perform_hole_punching(&socket, peer_addr, tunnel_code) {
             Ok(final_peer_addr) => {
                 info!(
@@ -587,6 +744,60 @@ pub fn send_server_status(
     Ok(())
 }
 
+/// Sends an authenticated release message from `tcp-to-quic` to `quic-to-tcp` when the client exits,
+/// allowing the server to release the session and transition back to `IDLE` on `rendezvous-server`.
+pub fn send_client_release(
+    socket: &UdpSocket,
+    peer_addr: SocketAddr,
+    tunnel_code: &str,
+) -> io::Result<()> {
+    let peer_addr = crate::utils::normalize_socket_addr(peer_addr);
+    let _ = socket.set_nonblocking(false);
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut buf = [0u8; 1024];
+
+    for attempt in 1..=3 {
+        let release_msg = PeerRelease::new_signed(tunnel_code);
+        let _ = socket.send_to(release_msg.as_bytes(), peer_addr);
+        debug!(
+            "[P2P Client Release] Sent PEER_RELEASE (attempt {}/3) to server {}",
+            attempt, peer_addr
+        );
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_millis(50) {
+            match socket.recv_from(&mut buf) {
+                Ok((len, src)) if crate::utils::normalize_socket_addr(src) == peer_addr => {
+                    let text = std::str::from_utf8(&buf[..len]).unwrap_or("").trim();
+                    if let Some(ack) = PeerReleaseAck::parse(text) {
+                        if ack.verify(tunnel_code) {
+                            info!(
+                                "[P2P Client Release] Server {} acknowledged release (transitioned to IDLE).",
+                                peer_addr
+                            );
+                            println!(
+                                "[P2P Client Release] Server {} acknowledged release (transitioned to IDLE).",
+                                peer_addr
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::Interrupted =>
+                {
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Re-negotiates UDP hole punching after an existing connection has been dropped or reset.
 pub fn reconnect_client_p2p_handshake(
     socket: &UdpSocket,
@@ -598,6 +809,9 @@ pub fn reconnect_client_p2p_handshake(
     let max_reconnect_attempts = 3;
 
     for attempt in 1..=max_reconnect_attempts {
+        if crate::utils::is_shutdown_requested() {
+            return Err("Shutdown requested".into());
+        }
         info!(
             "[P2P Reconnect] Attempt {}/{}: Reporting unreachable socket to Rendezvous Server {} for Tunnel ID {}...",
             attempt, max_reconnect_attempts, rendezvous_addr, tunnel_id
@@ -616,11 +830,18 @@ pub fn reconnect_client_p2p_handshake(
             let reset_msg = ClientReset::new_signed(&tunnel_id, tunnel_code);
             match socket.send_to(reset_msg.as_bytes(), rendezvous_addr) {
                 Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NetworkUnreachable || e.raw_os_error() == Some(101) => {
+                Err(e)
+                    if e.kind() == io::ErrorKind::NetworkUnreachable
+                        || e.raw_os_error() == Some(101) =>
+                {
                     error!(
                         "[P2P Reconnect ERROR] Network is unreachable to Rendezvous Server {}. Please check your {} network connectivity and routing.",
                         rendezvous_addr,
-                        if rendezvous_addr.is_ipv6() { "IPv6" } else { "IPv4" }
+                        if rendezvous_addr.is_ipv6() {
+                            "IPv6"
+                        } else {
+                            "IPv4"
+                        }
                     );
                     return Err(format!(
                         "Network is unreachable to Rendezvous Server {} (system has no active {} route)",
@@ -644,7 +865,10 @@ pub fn reconnect_client_p2p_handshake(
                     } else if reply.starts_with("ERR") {
                         last_err = reply.to_string();
                         warn!("[P2P Reconnect] Reset request rejected: {}", reply);
-                        if reply.contains("Authentication failed") || reply.contains("No server registered") || reply.contains("IP address family mismatch") {
+                        if reply.contains("Authentication failed")
+                            || reply.contains("No server registered")
+                            || reply.contains("IP address family mismatch")
+                        {
                             return Err(reply.into());
                         }
                     }
@@ -659,24 +883,54 @@ pub fn reconnect_client_p2p_handshake(
                 if attempt < max_reconnect_attempts {
                     warn!(
                         "[P2P Reconnect] Attempt {}/{} timed out waiting for PUNCH signal from Rendezvous Server ({}). Retrying in 1s...",
-                        attempt, max_reconnect_attempts, if last_err.is_empty() { "timeout" } else { &last_err }
+                        attempt,
+                        max_reconnect_attempts,
+                        if last_err.is_empty() {
+                            "timeout"
+                        } else {
+                            &last_err
+                        }
                     );
                     println!(
                         "[P2P Reconnect] Attempt {}/{} timed out waiting for PUNCH signal from Rendezvous Server ({}). Retrying in 1s...",
-                        attempt, max_reconnect_attempts, if last_err.is_empty() { "timeout" } else { &last_err }
+                        attempt,
+                        max_reconnect_attempts,
+                        if last_err.is_empty() {
+                            "timeout"
+                        } else {
+                            &last_err
+                        }
                     );
                     std::thread::sleep(Duration::from_secs(1));
                     continue;
                 } else {
                     error!(
                         "[P2P Reconnect ERROR] Failed to reconnect via Rendezvous Server after {} attempts ({}). Giving up.",
-                        max_reconnect_attempts, if last_err.is_empty() { "timeout" } else { &last_err }
+                        max_reconnect_attempts,
+                        if last_err.is_empty() {
+                            "timeout"
+                        } else {
+                            &last_err
+                        }
                     );
                     eprintln!(
                         "[P2P Reconnect ERROR] Failed to reconnect via Rendezvous Server after {} attempts ({}). Giving up.",
-                        max_reconnect_attempts, if last_err.is_empty() { "timeout" } else { &last_err }
+                        max_reconnect_attempts,
+                        if last_err.is_empty() {
+                            "timeout"
+                        } else {
+                            &last_err
+                        }
                     );
-                    return Err(format!("Failed to reconnect via Rendezvous Server: {}", if last_err.is_empty() { "timeout" } else { &last_err }).into());
+                    return Err(format!(
+                        "Failed to reconnect via Rendezvous Server: {}",
+                        if last_err.is_empty() {
+                            "timeout"
+                        } else {
+                            &last_err
+                        }
+                    )
+                    .into());
                 }
             }
         };

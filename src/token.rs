@@ -1,16 +1,30 @@
+use ring::rand::{SecureRandom, SystemRandom};
 use std::net;
+use std::sync::OnceLock;
+
+const HMAC_TAG_LEN: usize = 32;
+
+fn token_hmac_key() -> &'static ring::hmac::Key {
+    static KEY: OnceLock<ring::hmac::Key> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut key_bytes = [0u8; 32];
+        let _ = SystemRandom::new().fill(&mut key_bytes);
+        ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes)
+    })
+}
 
 pub fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
-    let mut token = Vec::new();
+    let mut token = Vec::with_capacity(6 + 16 + hdr.dcid.len() + HMAC_TAG_LEN);
     token.extend_from_slice(b"quiche");
 
-    let addr = match src.ip() {
-        std::net::IpAddr::V4(a) => a.octets().to_vec(),
-        std::net::IpAddr::V6(a) => a.octets().to_vec(),
-    };
+    match src.ip() {
+        std::net::IpAddr::V4(a) => token.extend_from_slice(&a.octets()),
+        std::net::IpAddr::V6(a) => token.extend_from_slice(&a.octets()),
+    }
 
-    token.extend_from_slice(&addr);
     token.extend_from_slice(&hdr.dcid);
+    let tag = ring::hmac::sign(token_hmac_key(), &token);
+    token.extend_from_slice(tag.as_ref());
     token
 }
 
@@ -18,21 +32,30 @@ pub fn validate_token<'a>(
     src: &net::SocketAddr,
     token: &'a [u8],
 ) -> Option<quiche::ConnectionId<'a>> {
-    if token.len() < 6 || &token[..6] != b"quiche" {
+    if token.len() < 6 + HMAC_TAG_LEN {
         return None;
     }
 
-    let token = &token[6..];
+    let (payload, tag) = token.split_at(token.len() - HMAC_TAG_LEN);
+    if ring::hmac::verify(token_hmac_key(), payload, tag).is_err() {
+        return None;
+    }
+
+    if &payload[..6] != b"quiche" {
+        return None;
+    }
+
+    let payload = &payload[6..];
     let addr = match src.ip() {
         std::net::IpAddr::V4(a) => a.octets().to_vec(),
         std::net::IpAddr::V6(a) => a.octets().to_vec(),
     };
 
-    if token.len() < addr.len() || &token[..addr.len()] != addr.as_slice() {
+    if payload.len() < addr.len() || &payload[..addr.len()] != addr.as_slice() {
         return None;
     }
 
-    Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
+    Some(quiche::ConnectionId::from_ref(&payload[addr.len()..]))
 }
 
 #[cfg(test)]

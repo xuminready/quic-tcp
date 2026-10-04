@@ -1,5 +1,47 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_shutdown_signal(_sig: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Installs OS signal handlers (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`) to allow graceful exit.
+pub fn install_shutdown_handlers() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" {
+            fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+        }
+        const SIGHUP: i32 = 1;
+        const SIGINT: i32 = 2;
+        const SIGQUIT: i32 = 3;
+        const SIGTERM: i32 = 15;
+        signal(SIGHUP, handle_shutdown_signal);
+        signal(SIGINT, handle_shutdown_signal);
+        signal(SIGQUIT, handle_shutdown_signal);
+        signal(SIGTERM, handle_shutdown_signal);
+    }
+}
+
+/// Returns `true` if a shutdown signal (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGQUIT`) or library stop request has been received.
+pub fn is_shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// Requests a graceful shutdown of any active proxy loop or P2P handshake.
+pub fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Clears the shutdown flag before starting a new proxy session in library mode.
+pub fn clear_shutdown() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+}
 
 pub fn would_block(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::WouldBlock
@@ -77,7 +119,12 @@ pub fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
             } else {
                 let is_link_local = octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80;
                 let scope_id = if is_link_local { v6.scope_id() } else { 0 };
-                SocketAddr::V6(std::net::SocketAddrV6::new(*v6.ip(), v6.port(), 0, scope_id))
+                SocketAddr::V6(std::net::SocketAddrV6::new(
+                    *v6.ip(),
+                    v6.port(),
+                    0,
+                    scope_id,
+                ))
             }
         }
         v4 => v4,

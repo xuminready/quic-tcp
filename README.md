@@ -19,7 +19,9 @@ Engineered for multi-hundred Mbps line rates using Rust's non-blocking `mio` lib
 
 ### 3. State Management & Reliability
 - **Early Data (0-RTT)**: Supports sending and receiving early data before full connection handshake completion.
-- **Partial Writes**: Non-blocking buffer queues cleanly handle flow-controlled write states across both TCP and QUIC transports.
+- **Partial Writes & Stream Limit Queuing**: Non-blocking buffer queues cleanly handle flow-controlled write states across both TCP and QUIC transports, and automatically queue pending TCP streams when the QUIC peer stream concurrency limit (`Error::StreamLimit`) is temporarily reached.
+- **Bidirectional Stream Closure Propagation**: When a client TCP socket disconnects or encounters an error, `tcp-to-quic` sends a QUIC `FIN` and `STOP_SENDING` (`stream_shutdown`) so `quic-to-tcp` immediately closes the corresponding backend TCP socket without leaking half-open descriptors.
+- **Graceful Client Exit & Server Release**: When `tcp-to-quic` exits (`SIGINT` / `SIGTERM`), it sends a QUIC `CONNECTION_CLOSE` along with an authenticated `PEER_RELEASE` packet (acknowledged by `PEER_RELEASE_ACK`) directly to `quic-to-tcp`, which immediately cleans up active sessions and notifies `rendezvous-server` (`STATUS <tunnel_id> IDLE`) so new clients can connect without waiting for timeouts.
 - **Periodic PING Keepalives (NAT Mapping Maintenance)**: Both `tcp-to-quic` and `quic-to-tcp` send periodic ACK-eliciting PING frames every 5 seconds over the QUIC tunnel in P2P mode to ensure bidirectional NAT state remains warm and never expires.
 - **Dead Socket Detection & Automatic RESET**: If periodic PINGs go unanswered for >15 seconds (or the QUIC connection closes), `tcp-to-quic` detects the socket is no longer usable, sends an authenticated `RESET` report to `rendezvous-server`, which signals `quic-to-tcp` to cleanly reset active sessions and restart the 3-way UDP hole punching process to restore the connection seamlessly.
 
@@ -47,7 +49,7 @@ flowchart TD
 
 1. **Zero-Knowledge Rendezvous Routing**:
    - The server and client derive a 16-character hex `Tunnel ID` from their shared secret (`derive_tunnel_id`).
-   - The Rendezvous server pairs clients and servers based on this `Tunnel ID` and validates signatures.
+   - The Rendezvous server pairs clients and servers based on this `Tunnel ID` and validates signatures using constant-time HMAC verification (`ring::hmac::verify`).
    - Unauthorized parties cannot probe or connect to tunnels without presenting valid HMAC signatures generated from the secret code.
 
 2. **Peer Inactivity Timeout & OFFLINE Tracking**:
@@ -57,19 +59,20 @@ flowchart TD
    - When the server sends a keepalive again, it automatically recovers back **`ONLINE`**.
    - Completely inactive tunnels are pruned after `stale_cleanup_timeout` (default 120 seconds, configurable via `RENDEZVOUS_CLEANUP_TIMEOUT_SECS`).
 
-3. **End-to-End Mutual Authentication**:
+3. **End-to-End Mutual Authentication & Authenticated Retry Tokens**:
    - In **both Direct Mode and P2P Mode**, `quic-to-tcp` and `tcp-to-quic` mutually authenticate each other over reserved **Stream 0**.
    - Upon connection establishment, `tcp-to-quic` sends an authenticated `AUTH <seq> <hmac>` challenge on stream 0. `quic-to-tcp` validates the HMAC and replay sequence, replying with `AUTH_OK <seq> <hmac>`. Unauthenticated sessions or invalid codes are terminated immediately.
+   - In Direct Mode, `quic-to-tcp` mints and validates QUIC Retry address-validation tokens signed with a per-process 256-bit `HMAC_SHA256` key to prevent IP spoofing and token forgery.
    - Proxy TCP data streams start at stream ID 4 (`current_stream_id = 4`).
 
 4. **Replay Attack Filter**:
-   - Every authenticated control packet, hole punching probe, and stream 0 handshake frame includes a timestamp-derived sequence number (`seq`).
+   - Every authenticated control packet, hole punching probe, peer release signal, and stream 0 handshake frame includes a strictly monotonic timestamp-derived sequence number (`seq`).
    - Receivers (`rendezvous-server`, `quic-to-tcp`, and `tcp-to-quic`) enforce a 120-second sliding time window and track seen sequences in a memory-bounded `ReplayFilter` to eliminate replay attacks.
 
 5. **Exclusive `BUSY` Server Protection**:
    - Once a server accepts a client connection, its status transitions to **`BUSY`**.
    - Subsequent connection requests from other clients for that tunnel are rejected while the server is active.
-   - When the client connection closes, the server automatically transitions back to **`IDLE`**.
+   - When the client connection closes or exits cleanly (`PEER_RELEASE`), the server automatically transitions back to **`IDLE`**.
 
 6. **Multi-Round Hole Punching with Retries & Progress Logs**:
    - **Multi-Round Probing**: Hole punching executes up to 3 rounds of probes (20 probes per round at 50ms intervals) with signed HMAC probes (`PEER_PUNCH`, `PEER_PUNCH_ACK`, `PEER_PUNCH_ACK_ACK`).
@@ -390,7 +393,7 @@ Typical performance on local/LAN benchmarks:
 
 ## Certificate Generation
 
-The server proxy (`quic-to-tcp`) requires a TLS certificate and private key (`cert.crt` and `cert.key`) in its working directory.
+The server proxy (`quic-to-tcp`) requires a TLS certificate and private key (`cert.crt` and `cert.key` by default, or custom paths via `QUIC_CERT_PATH` and `QUIC_KEY_PATH` environment variables).
 
 Generate a self-signed certificate for development/testing:
 ```bash
@@ -399,14 +402,70 @@ openssl req -x509 -newkey rsa:2048 -keyout cert.key -out cert.crt -days 365 -nod
 
 ---
 
+## Android Shared Libraries & Phone/Watch App
+
+`quic-tcp` compiles into native Android shared libraries (`libquic_to_tcp.so` and `libtcp_to_quic.so`) for both 32-bit ARM (`armeabi-v7a` / `armv7-linux-androideabi`, e.g., Pixel Watch / merioth) and 64-bit ARM64 (`arm64-v8a` / `aarch64-linux-android`, e.g., Pixel phones / yogi / yoga), and includes a complete Android Phone & Wear OS Watch application under [`android/`](android/).
+
+### 1. Build Native Libraries & Signed APKs
+```bash
+./build_android.sh all
+```
+Or build specific targets:
+- `./build_android.sh merioth`: Builds 32-bit `armv7-linux-androideabi` binaries and shared libraries (`libquic_to_tcp.so`, `libtcp_to_quic.so`).
+- `./build_android.sh yogi`: Builds 64-bit `aarch64-linux-android` binaries and shared libraries (`libquic_to_tcp.so`, `libtcp_to_quic.so`).
+- `./build_android.sh apk`: Compiles and signs the Android Phone and Wear OS Watch APKs using the staged native libraries.
+
+### 2. Output Artifacts
+- **32-bit Android Shared Libraries (`armeabi-v7a`)**:
+  - `target/armv7-linux-androideabi/release/libquic_to_tcp.so`
+  - `target/armv7-linux-androideabi/release/libtcp_to_quic.so`
+  - `android/app/src/main/jniLibs/armeabi-v7a/{libquic_to_tcp.so,libtcp_to_quic.so}`
+- **64-bit Android Shared Libraries (`arm64-v8a`)**:
+  - `target/aarch64-linux-android/release/libquic_to_tcp.so`
+  - `target/aarch64-linux-android/release/libtcp_to_quic.so`
+  - `android/app/src/main/jniLibs/arm64-v8a/{libquic_to_tcp.so,libtcp_to_quic.so}`
+- **Signed APKs**:
+  - `android/build/quic-tcp-phone.apk` (Android Phone APK)
+  - `android/build/quic-tcp-watch.apk` (Wear OS Watch APK with `android.hardware.type.watch` feature)
+  - `android/build/quic-tcp-universal.apk` (Universal APK compatible with both Phone and Watch)
+
+### 3. Android App Features
+- **Engine Role Selection**: Switch between `tcp-to-quic` (Client) and `quic-to-tcp` (Server), backed by [`TcpToQuicLib`](android/app/src/main/java/com/quictcp/app/TcpToQuicLib.java) (`libtcp_to_quic.so`) and [`QuicToTcpLib`](android/app/src/main/java/com/quictcp/app/QuicToTcpLib.java) (`libquic_to_tcp.so`).
+- **Connection Type Selection**: Switch between **P2P (Rendezvous)** and **Direct** mode:
+  - **P2P Mode**: Displays `Rendezvous_IP:Port`, Local IP (default `127.0.0.1`), Local Port (default `1088`), and Secret (`tunnel-ssh-secret`).
+  - **Direct Mode**: Automatically hides `Rendezvous_IP:Port` and shows Direct QUIC UDP `IP:Port`, Local IP (`127.0.0.1`), Local Port (`1088`), and Secret (`tunnel-ssh-secret`).
+- **Connect / Disconnect Button**: Starts and stops the native proxy engine cleanly (sending `PEER_RELEASE` to the server on client stop).
+- **Live Log Output Area**: Streams real-time logs from the Rust `quic-to-tcp` and `tcp-to-quic` libraries via JNI (`drainLogs()`) with auto-scroll and Clear Log controls.
+- **Persistent Settings**: Automatically saves and restores all user inputs via `SharedPreferences` ([`ProxyConfig`](android/app/src/main/java/com/quictcp/app/ProxyConfig.java)).
+- **Background Execution**: Runs inside [`ProxyForegroundService`](android/app/src/main/java/com/quictcp/app/ProxyForegroundService.java) (`START_STICKY`) with a persistent foreground notification (including a quick **Disconnect** action button), `PARTIAL_WAKE_LOCK`, and high-performance `WifiLock` so the tunnel stays alive when the app is minimized or the screen is off.
+
+### 4. Install via ADB
+```bash
+# Install on an Android Phone:
+adb install -r android/build/quic-tcp-phone.apk
+
+# Install on a Wear OS Watch:
+adb install -r android/build/quic-tcp-watch.apk
+```
+
+---
+
 ## Project Structure
 
-- [`src/lib.rs`](src/lib.rs): Core module re-exports and constants (`MAX_DATAGRAM_SIZE = 1200`).
-- [`src/auth.rs`](src/auth.rs): `derive_tunnel_id`, HMAC-SHA256 signing/verification, atomic timestamp sequence generation, and memory-bounded `ReplayFilter`.
-- [`src/protocol.rs`](src/protocol.rs): Control message definitions (`ServerReg`, `RegOk`, `ServerStatusMsg`, `ClientConn`, `ClientReset`, `PunchSignal`, `PeerProbe`).
-- [`src/p2p.rs`](src/p2p.rs): P2P handshake orchestration, 3-way UDP hole punching, keepalive signaling, and automatic reconnection handling.
+- [`src/lib.rs`](src/lib.rs): Core module re-exports and constants (`MAX_DATAGRAM_SIZE = 1200`, `APPLICATION_PROTO`).
+- [`src/quic_to_tcp.rs`](src/quic_to_tcp.rs): Reusable `quic-to-tcp` server engine (`ServerMode`, `run_quic_to_tcp`) with embedded TLS certificate fallback for Android and CLI.
+- [`src/tcp_to_quic.rs`](src/tcp_to_quic.rs): Reusable `tcp-to-quic` client engine (`ClientMode`, `run_tcp_to_quic`) for Android and CLI.
+- [`src/android_jni.rs`](src/android_jni.rs): JNI exports (`QuicToTcpLib` and `TcpToQuicLib`) and thread-safe in-memory log ring buffer (`ProxyLogger`) + Android Logcat bridge.
+- [`src/auth.rs`](src/auth.rs): `derive_tunnel_id`, constant-time HMAC-SHA256 signing/verification, strictly monotonic atomic sequence generation, and memory-bounded `ReplayFilter`.
+- [`src/config.rs`](src/config.rs): CLI argument parsing (`ProxyCliArgs`, `ProxyMode`, `RendezvousConfig`) and QUIC transport/TLS configuration builders.
+- [`src/error.rs`](src/error.rs): Unified `ProxyError` and `Result<T>` error types across all modules.
+- [`src/protocol.rs`](src/protocol.rs): Control message definitions (`ServerReg`, `RegOk`, `ServerStatusMsg`, `ClientConn`, `ClientReset`, `PunchSignal`, `PeerProbe`, `PeerRelease`).
+- [`src/p2p.rs`](src/p2p.rs): P2P handshake orchestration, 3-way UDP hole punching, replay-protected signaling, graceful peer release (`send_peer_release`), and automatic reconnection handling.
 - [`src/session.rs`](src/session.rs): QUIC session state management, Stream 0 mutual authentication, non-blocking stream multiplexing, 128 KB batch read buffers, and partial write buffers.
-- [`src/utils.rs`](src/utils.rs): Non-blocking helper routines, socket buffer tuning (`SO_RCVBUF`/`SO_SNDBUF`), `TCP_NODELAY` configuration, and stream ID allocation (streams >= 4).
-- [`src/bin/tcp_to_quic.rs`](src/bin/tcp_to_quic.rs): Client proxy binary supporting Direct and P2P modes with Stream 0 auth and reachability monitoring.
-- [`src/bin/quic_to_tcp.rs`](src/bin/quic_to_tcp.rs): Server proxy binary supporting Direct and P2P modes with Stream 0 verification, keepalives, and status tracking.
+- [`src/stream_map.rs`](src/stream_map.rs): Bidirectional token-to-stream mapping (`StreamMap`) for O(1) lookup and cleanup of active TCP/QUIC streams.
+- [`src/token.rs`](src/token.rs): HMAC-SHA256 authenticated QUIC Retry token minting and validation (`mint_token`, `validate_token`).
+- [`src/utils.rs`](src/utils.rs): Non-blocking helper routines, POSIX signal handling (`install_shutdown_handlers`, `is_shutdown_requested`, `request_shutdown`), socket buffer tuning (`SO_RCVBUF`/`SO_SNDBUF`), `TCP_NODELAY`, and stream ID allocation.
+- [`src/bin/tcp_to_quic.rs`](src/bin/tcp_to_quic.rs): Client proxy binary supporting Direct and P2P modes with Stream 0 auth, stream-limit queuing, reachability monitoring, and graceful exit release.
+- [`src/bin/quic_to_tcp.rs`](src/bin/quic_to_tcp.rs): Server proxy binary supporting Direct and P2P modes with multi-client sessions, Stream 0 verification, keepalives, and status tracking.
 - [`src/bin/rendezvous_server.rs`](src/bin/rendezvous_server.rs): Central coordination server for authenticated UDP hole punching, zero-knowledge tunnel matching, peer inactivity timeouts, and replay prevention.
+- [`android/`](android/): Android Phone and Wear OS Watch app project (`MainActivity`, `ProxyForegroundService`, `ProxyConfig`, `QuicToTcpLib`, `TcpToQuicLib`).

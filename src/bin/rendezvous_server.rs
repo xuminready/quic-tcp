@@ -1,4 +1,4 @@
-use quic_tcp::auth::{compute_auth, next_seq, ReplayFilter};
+use quic_tcp::auth::{ReplayFilter, compute_auth, next_seq};
 use quic_tcp::normalize_socket_addr;
 use quic_tcp::protocol::{ClientConn, ClientReset, PunchSignal, RegOk, ServerReg, ServerStatusMsg};
 use std::collections::HashMap;
@@ -98,7 +98,12 @@ impl RendezvousServer {
                 let last_seen_str = format!("{:.1}s ago", record.last_seen.elapsed().as_secs_f32());
                 println!(
                     "  Tunnel ID '{}' ({}, Port: {}) -> Status: {:<7} | Last Seen: {:<9} | {}",
-                    tunnel_id, record.public_addr, record.tcp_port, record.status, last_seen_str, client_str
+                    tunnel_id,
+                    record.public_addr,
+                    record.tcp_port,
+                    record.status,
+                    last_seen_str,
+                    client_str
                 );
             }
         }
@@ -107,24 +112,34 @@ impl RendezvousServer {
 
     fn handle_reg(&mut self, text: &str, src: SocketAddr) {
         let Some(reg) = ServerReg::parse(text) else {
-            self.socket
-                .send_to(b"ERR Invalid REG format", src)
-                .ok();
+            self.socket.send_to(b"ERR Invalid REG format", src).ok();
             return;
         };
 
         if !self.replay_filter.check_and_add(reg.seq) {
-            eprintln!("[REPLAY ATTACK] Duplicate/stale sequence number {} from {}", reg.seq, src);
+            eprintln!(
+                "[REPLAY ATTACK] Duplicate/stale sequence number {} from {}",
+                reg.seq, src
+            );
             self.socket
-                .send_to(b"ERR Replay attack detected: duplicate or stale sequence number", src)
+                .send_to(
+                    b"ERR Replay attack detected: duplicate or stale sequence number",
+                    src,
+                )
                 .ok();
             return;
         }
 
         if !reg.verify(&reg.tunnel_code) {
-            eprintln!("[AUTH FAILURE] Invalid HMAC from {} for REG command (rejected registration)", src);
+            eprintln!(
+                "[AUTH FAILURE] Invalid HMAC from {} for REG command (rejected registration)",
+                src
+            );
             self.socket
-                .send_to(b"ERR Server registration rejected: invalid HMAC signature", src)
+                .send_to(
+                    b"ERR Server registration rejected: invalid HMAC signature",
+                    src,
+                )
                 .ok();
             return;
         }
@@ -132,7 +147,10 @@ impl RendezvousServer {
         // If tunnel already exists, ensure passcode matches
         if let Some(existing) = self.servers.get(&reg.tunnel_id) {
             if existing.tunnel_code != reg.tunnel_code {
-                eprintln!("[AUTH FAILURE] Tunnel ID conflict with different secret from {}", src);
+                eprintln!(
+                    "[AUTH FAILURE] Tunnel ID conflict with different secret from {}",
+                    src
+                );
                 self.socket
                     .send_to(b"ERR Server registration rejected: tunnel ID already registered with different secret", src)
                     .ok();
@@ -140,9 +158,20 @@ impl RendezvousServer {
             }
         }
 
-        let was_offline = self.servers.get(&reg.tunnel_id).map(|r| r.status == "OFFLINE").unwrap_or(false);
-        let prev_client = self.servers.get(&reg.tunnel_id).and_then(|r| r.connected_client);
-        let connected_client = if reg.status == "IDLE" { None } else { prev_client };
+        let was_offline = self
+            .servers
+            .get(&reg.tunnel_id)
+            .map(|r| r.status == "OFFLINE")
+            .unwrap_or(false);
+        let prev_client = self
+            .servers
+            .get(&reg.tunnel_id)
+            .and_then(|r| r.connected_client);
+        let connected_client = if reg.status == "IDLE" {
+            None
+        } else {
+            prev_client
+        };
         let is_update = self.servers.contains_key(&reg.tunnel_id);
 
         self.servers.insert(
@@ -180,10 +209,15 @@ impl RendezvousServer {
     }
 
     fn handle_status(&mut self, text: &str, src: SocketAddr) {
-        let Some(msg) = ServerStatusMsg::parse(text) else { return; };
+        let Some(msg) = ServerStatusMsg::parse(text) else {
+            return;
+        };
 
         if !self.replay_filter.check_and_add(msg.seq) {
-            eprintln!("[REPLAY ATTACK] Duplicate/stale sequence number {} from {}", msg.seq, src);
+            eprintln!(
+                "[REPLAY ATTACK] Duplicate/stale sequence number {} from {}",
+                msg.seq, src
+            );
             return;
         }
 
@@ -192,7 +226,10 @@ impl RendezvousServer {
         };
 
         if !msg.verify(&record.tunnel_code) {
-            eprintln!("[AUTH FAILURE] Invalid HMAC from {} for STATUS command", src);
+            eprintln!(
+                "[AUTH FAILURE] Invalid HMAC from {} for STATUS command",
+                src
+            );
             self.socket
                 .send_to(b"ERR Server status rejected: invalid passcode HMAC", src)
                 .ok();
@@ -205,7 +242,10 @@ impl RendezvousServer {
         if msg.status == "IDLE" {
             record.connected_client = None;
         }
-        println!("[Auth OK] Tunnel '{}' status updated to: {}", msg.tunnel_id, msg.status);
+        println!(
+            "[Auth OK] Tunnel '{}' status updated to: {}",
+            msg.tunnel_id, msg.status
+        );
 
         let resp_seq = next_seq();
         let resp_payload = format!("STATUS_OK:{}", resp_seq);
@@ -221,9 +261,15 @@ impl RendezvousServer {
         };
 
         if !self.replay_filter.check_and_add(conn.seq) {
-            eprintln!("[REPLAY ATTACK] Duplicate/stale sequence number {} from {}", conn.seq, src);
+            eprintln!(
+                "[REPLAY ATTACK] Duplicate/stale sequence number {} from {}",
+                conn.seq, src
+            );
             self.socket
-                .send_to(b"ERR Replay attack detected: duplicate or stale sequence number", src)
+                .send_to(
+                    b"ERR Replay attack detected: duplicate or stale sequence number",
+                    src,
+                )
                 .ok();
             return;
         }
@@ -231,16 +277,28 @@ impl RendezvousServer {
         let target_record = match self.servers.get_mut(&conn.tunnel_id) {
             Some(rec) => rec,
             None => {
-                eprintln!("[CONN REJECTED] No tunnel registered matching ID {}", conn.tunnel_id);
-                let err_msg = format!("ERR No server registered matching tunnel ID {}", conn.tunnel_id);
+                eprintln!(
+                    "[CONN REJECTED] No tunnel registered matching ID {}",
+                    conn.tunnel_id
+                );
+                let err_msg = format!(
+                    "ERR No server registered matching tunnel ID {}",
+                    conn.tunnel_id
+                );
                 self.socket.send_to(err_msg.as_bytes(), src).ok();
                 return;
             }
         };
 
         if !conn.verify(&target_record.tunnel_code) {
-            eprintln!("[AUTH FAILURE] Client {} provided invalid passcode for tunnel {}", src, conn.tunnel_id);
-            let err_msg = format!("ERR Authentication failed: incorrect passcode for tunnel {}", conn.tunnel_id);
+            eprintln!(
+                "[AUTH FAILURE] Client {} provided invalid passcode for tunnel {}",
+                src, conn.tunnel_id
+            );
+            let err_msg = format!(
+                "ERR Authentication failed: incorrect passcode for tunnel {}",
+                conn.tunnel_id
+            );
             self.socket.send_to(err_msg.as_bytes(), src).ok();
             return;
         }
@@ -261,7 +319,10 @@ impl RendezvousServer {
         }
 
         if target_record.status == "BUSY" {
-            println!("[REJECTED] Client {} requested tunnel {} but it is BUSY", src, conn.tunnel_id);
+            println!(
+                "[REJECTED] Client {} requested tunnel {} but it is BUSY",
+                src, conn.tunnel_id
+            );
             let err_msg = format!(
                 "ERR Tunnel {} is currently BUSY and already connected to another client",
                 conn.tunnel_id
@@ -277,7 +338,11 @@ impl RendezvousServer {
         // Check that both peers use the same IP family (IPv4 vs IPv6)
         if src.is_ipv4() != target_addr.is_ipv4() {
             let client_ip_type = if src.is_ipv4() { "IPv4" } else { "IPv6" };
-            let server_ip_type = if target_addr.is_ipv4() { "IPv4" } else { "IPv6" };
+            let server_ip_type = if target_addr.is_ipv4() {
+                "IPv4"
+            } else {
+                "IPv6"
+            };
             eprintln!(
                 "[IP MISMATCH ERROR] Tunnel ID '{}': Client ({}: {}) and Server ({}: {}) use different IP versions. Rejecting connection.",
                 conn.tunnel_id, client_ip_type, src, server_ip_type, target_addr
@@ -304,7 +369,9 @@ impl RendezvousServer {
 
         // Control PUNCH to target server (passive)
         let punch_to_srv = PunchSignal::new_passive_signed(src, &srv_code);
-        self.socket.send_to(punch_to_srv.as_bytes(), target_addr).ok();
+        self.socket
+            .send_to(punch_to_srv.as_bytes(), target_addr)
+            .ok();
 
         // Control PUNCH to client (active)
         let punch_to_cli = PunchSignal::new_active_signed(target_addr, &srv_code);
@@ -318,9 +385,15 @@ impl RendezvousServer {
         };
 
         if !self.replay_filter.check_and_add(reset.seq) {
-            eprintln!("[REPLAY ATTACK] Duplicate/stale sequence number {} from {}", reset.seq, src);
+            eprintln!(
+                "[REPLAY ATTACK] Duplicate/stale sequence number {} from {}",
+                reset.seq, src
+            );
             self.socket
-                .send_to(b"ERR Replay attack detected: duplicate or stale sequence number", src)
+                .send_to(
+                    b"ERR Replay attack detected: duplicate or stale sequence number",
+                    src,
+                )
                 .ok();
             return;
         }
@@ -328,16 +401,28 @@ impl RendezvousServer {
         let target_record = match self.servers.get_mut(&reset.tunnel_id) {
             Some(rec) => rec,
             None => {
-                eprintln!("[RESET REJECTED] No tunnel registered matching ID {}", reset.tunnel_id);
-                let err_msg = format!("ERR No server registered matching tunnel ID {}", reset.tunnel_id);
+                eprintln!(
+                    "[RESET REJECTED] No tunnel registered matching ID {}",
+                    reset.tunnel_id
+                );
+                let err_msg = format!(
+                    "ERR No server registered matching tunnel ID {}",
+                    reset.tunnel_id
+                );
                 self.socket.send_to(err_msg.as_bytes(), src).ok();
                 return;
             }
         };
 
         if !reset.verify(&target_record.tunnel_code) {
-            eprintln!("[AUTH FAILURE] Client {} provided invalid passcode for RESET on tunnel {}", src, reset.tunnel_id);
-            let err_msg = format!("ERR Authentication failed: incorrect passcode for tunnel {}", reset.tunnel_id);
+            eprintln!(
+                "[AUTH FAILURE] Client {} provided invalid passcode for RESET on tunnel {}",
+                src, reset.tunnel_id
+            );
+            let err_msg = format!(
+                "ERR Authentication failed: incorrect passcode for tunnel {}",
+                reset.tunnel_id
+            );
             self.socket.send_to(err_msg.as_bytes(), src).ok();
             return;
         }
@@ -362,7 +447,11 @@ impl RendezvousServer {
         // Check that both peers use the same IP family (IPv4 vs IPv6)
         if src.is_ipv4() != target_addr.is_ipv4() {
             let client_ip_type = if src.is_ipv4() { "IPv4" } else { "IPv6" };
-            let server_ip_type = if target_addr.is_ipv4() { "IPv4" } else { "IPv6" };
+            let server_ip_type = if target_addr.is_ipv4() {
+                "IPv4"
+            } else {
+                "IPv6"
+            };
             eprintln!(
                 "[IP MISMATCH ERROR] Tunnel ID '{}': Client ({}: {}) and Server ({}: {}) use different IP versions during RESET. Rejecting.",
                 reset.tunnel_id, client_ip_type, src, server_ip_type, target_addr
@@ -389,7 +478,9 @@ impl RendezvousServer {
 
         // Control PUNCH to target server (passive)
         let punch_to_srv = PunchSignal::new_passive_signed(src, &srv_code);
-        self.socket.send_to(punch_to_srv.as_bytes(), target_addr).ok();
+        self.socket
+            .send_to(punch_to_srv.as_bytes(), target_addr)
+            .ok();
 
         // Control PUNCH to client (active)
         let punch_to_cli = PunchSignal::new_active_signed(target_addr, &srv_code);

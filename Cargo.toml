@@ -6,9 +6,13 @@ license = "BSD-2-Clause"
 repository = "https://github.com/xuminready/quic-tcp"
 edition = "2024"
 
+[lib]
+name = "quic_tcp"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 env_logger = "0.11.11"
-log = { version = "0.4.34", features = ["max_level_trace", "release_max_level_warn"] }
+log = { version = "0.4.34", features = ["max_level_trace"] }
 mio = { version = "1.2.2", features = ["net", "os-poll"] }
 quiche = "0.29.3"
 ring = "0.17.14"

@@ -10,31 +10,73 @@ const MAX_TIME_WINDOW_MS: u64 = 120_000;
 /// Maximum cache size for tracked sequence numbers before pruning.
 const MAX_SEEN_SEQS_CAPACITY: usize = 10_000;
 
+/// Normalizes a user-provided secret passcode so Linux CLI (including bash `"Ready\!"` escaping
+/// or quoted strings) and Android UI inputs always derive the exact same Tunnel ID and HMAC key.
+pub fn normalize_secret(passcode: &str) -> String {
+    let mut s = passcode.trim();
+    while s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s = s[1..s.len() - 1].trim();
+    }
+    s.replace("\\!", "!")
+}
+
 /// Computes an HMAC-SHA256 signature for the given payload using the provided passcode.
 pub fn compute_auth(passcode: &str, payload: &str) -> String {
-    let s_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, passcode.as_bytes());
+    let normalized = normalize_secret(passcode);
+    let s_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, normalized.as_bytes());
     let tag = ring::hmac::sign(&s_key, payload.as_bytes());
     hex_dump(tag.as_ref())
 }
 
-/// Verifies whether the provided signature matches the HMAC-SHA256 of the payload.
+/// Verifies whether the provided signature matches the HMAC-SHA256 of the payload
+/// using constant-time `ring::hmac::verify` to prevent timing side-channel attacks.
 pub fn verify_auth(passcode: &str, payload: &str, signature: &str) -> bool {
-    let expected = compute_auth(passcode, payload);
-    expected == signature
+    if signature.len() != 64 {
+        return false;
+    }
+    let mut sig_bytes = [0u8; 32];
+    for (i, chunk) in signature.as_bytes().chunks_exact(2).enumerate() {
+        let Ok(hex_str) = std::str::from_utf8(chunk) else {
+            return false;
+        };
+        let Ok(byte) = u8::from_str_radix(hex_str, 16) else {
+            return false;
+        };
+        sig_bytes[i] = byte;
+    }
+    let normalized = normalize_secret(passcode);
+    let s_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, normalized.as_bytes());
+    ring::hmac::verify(&s_key, payload.as_bytes(), &sig_bytes).is_ok()
 }
 
-static SEQ_COUNTER: AtomicU64 = AtomicU64::new(1);
+static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Generates a monotonically increasing 64-bit sequence number:
+/// Generates a strictly monotonically increasing 64-bit sequence number:
 /// - Upper 54 bits: Millisecond timestamp since UNIX Epoch.
-/// - Lower 10 bits: Atomic incrementing counter modulo 1024.
+/// - Lower 10 bits: Sub-millisecond counter, advancing smoothly even during >1024/ms bursts.
 pub fn next_seq() -> u64 {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let cnt = SEQ_COUNTER.fetch_add(1, Ordering::Relaxed) % 1024;
-    (now_ms << 10) | cnt
+    let candidate_base = now_ms << 10;
+
+    loop {
+        let prev = LAST_SEQ.load(Ordering::Relaxed);
+        let next = if candidate_base > prev {
+            candidate_base | 1
+        } else {
+            prev + 1
+        };
+        if LAST_SEQ
+            .compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
 }
 
 /// Filter that guards against replay attacks using a sliding timestamp window and sequence deduplication.
@@ -61,7 +103,9 @@ impl ReplayFilter {
         let pkt_time_ms = seq >> 10;
 
         // Verify window within 120 seconds of local clock
-        if pkt_time_ms > now_ms + MAX_TIME_WINDOW_MS || now_ms.saturating_sub(pkt_time_ms) > MAX_TIME_WINDOW_MS {
+        if pkt_time_ms > now_ms + MAX_TIME_WINDOW_MS
+            || now_ms.saturating_sub(pkt_time_ms) > MAX_TIME_WINDOW_MS
+        {
             return false;
         }
 
@@ -92,7 +136,8 @@ impl Default for ReplayFilter {
 
 /// Derives a deterministic, 16-character hex tunnel ID from a passcode/secret.
 pub fn derive_tunnel_id(passcode: &str) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, passcode.as_bytes());
+    let normalized = normalize_secret(passcode);
+    let digest = ring::digest::digest(&ring::digest::SHA256, normalized.as_bytes());
     hex_dump(&digest.as_ref()[..8])
 }
 
@@ -119,6 +164,14 @@ mod tests {
         assert_eq!(id1, id2);
         assert_eq!(id1.len(), 16);
         assert_ne!(id1, id3);
+
+        // Verify "Ready!" produces 91213ceb7548b8dc consistently across raw, bash-escaped, and quoted inputs
+        assert_eq!(derive_tunnel_id("Ready!"), "91213ceb7548b8dc");
+        assert_eq!(derive_tunnel_id(r"Ready\!"), "91213ceb7548b8dc");
+        assert_eq!(derive_tunnel_id(r#""Ready!""#), "91213ceb7548b8dc");
+        assert_eq!(derive_tunnel_id(r#""Ready\!""#), "91213ceb7548b8dc");
+        assert_eq!(derive_tunnel_id("'Ready!'"), "91213ceb7548b8dc");
+        assert_eq!(derive_tunnel_id(" Ready! "), "91213ceb7548b8dc");
     }
 
     #[test]

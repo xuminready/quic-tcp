@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use crate::auth::{compute_auth, next_seq, verify_auth};
+use std::net::SocketAddr;
 
 /// Registration message sent by `quic-to-tcp` servers to `rendezvous-server`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,16 +13,17 @@ pub struct ServerReg {
 }
 
 impl ServerReg {
-    pub fn new_signed(
-        tunnel_id: &str,
-        tcp_port: u16,
-        status: &str,
-        tunnel_code: &str,
-    ) -> String {
+    pub fn new_signed(tunnel_id: &str, tcp_port: u16, status: &str, tunnel_code: &str) -> String {
         let seq = next_seq();
-        let payload = format!("REG:{}:{}:{}:{}:{}", tunnel_id, tcp_port, status, tunnel_code, seq);
+        let payload = format!(
+            "REG:{}:{}:{}:{}:{}",
+            tunnel_id, tcp_port, status, tunnel_code, seq
+        );
         let hmac = compute_auth(tunnel_code, &payload);
-        format!("REG {} {} {} {} {} {}", tunnel_id, tcp_port, status, tunnel_code, seq, hmac)
+        format!(
+            "REG {} {} {} {} {} {}",
+            tunnel_id, tcp_port, status, tunnel_code, seq, hmac
+        )
     }
 
     pub fn parse(text: &str) -> Option<Self> {
@@ -251,16 +252,30 @@ impl PunchSignal {
 
     pub fn verify(&self, tunnel_code: &str) -> bool {
         match self {
-            PunchSignal::Passive { client_addr, seq, hmac } => {
+            PunchSignal::Passive {
+                client_addr,
+                seq,
+                hmac,
+            } => {
                 let client_addr = crate::utils::normalize_socket_addr(*client_addr);
                 let payload = format!("PUNCH:{}:passive:{}", client_addr, seq);
                 verify_auth(tunnel_code, &payload, hmac)
             }
-            PunchSignal::Active { server_addr, seq, hmac } => {
+            PunchSignal::Active {
+                server_addr,
+                seq,
+                hmac,
+            } => {
                 let server_addr = crate::utils::normalize_socket_addr(*server_addr);
                 let payload = format!("PUNCH:{}:active:{}", server_addr, seq);
                 verify_auth(tunnel_code, &payload, hmac)
             }
+        }
+    }
+
+    pub fn seq(&self) -> u64 {
+        match self {
+            PunchSignal::Passive { seq, .. } | PunchSignal::Active { seq, .. } => *seq,
         }
     }
 }
@@ -337,6 +352,73 @@ impl PeerProbe {
     }
 }
 
+/// Release message sent by `tcp-to-quic` to `quic-to-tcp` when the client exits,
+/// instructing the server to release the session and transition back to IDLE on `rendezvous-server`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRelease {
+    pub seq: u64,
+    pub hmac: String,
+}
+
+impl PeerRelease {
+    pub fn new_signed(passcode: &str) -> String {
+        let seq = next_seq();
+        let payload = format!("PEER_RELEASE:{}", seq);
+        let hmac = compute_auth(passcode, &payload);
+        format!("PEER_RELEASE {} {}", seq, hmac)
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        if parts.len() >= 3 && parts[0] == "PEER_RELEASE" {
+            Some(Self {
+                seq: parts[1].parse().ok()?,
+                hmac: parts[2].to_string(),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn verify(&self, passcode: &str) -> bool {
+        let payload = format!("PEER_RELEASE:{}", self.seq);
+        verify_auth(passcode, &payload, &self.hmac)
+    }
+}
+
+/// Acknowledgment sent by `quic-to-tcp` to `tcp-to-quic` upon receiving `PeerRelease`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerReleaseAck {
+    pub seq: u64,
+    pub hmac: String,
+}
+
+impl PeerReleaseAck {
+    pub fn new_signed(passcode: &str) -> String {
+        let seq = next_seq();
+        let payload = format!("PEER_RELEASE_ACK:{}", seq);
+        let hmac = compute_auth(passcode, &payload);
+        format!("PEER_RELEASE_ACK {} {}", seq, hmac)
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        if parts.len() >= 3 && parts[0] == "PEER_RELEASE_ACK" {
+            Some(Self {
+                seq: parts[1].parse().ok()?,
+                hmac: parts[2].to_string(),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn verify(&self, passcode: &str) -> bool {
+        let payload = format!("PEER_RELEASE_ACK:{}", self.seq);
+        verify_auth(passcode, &payload, &self.hmac)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +469,18 @@ mod tests {
         let ack_ack = PeerProbe::new_ack_ack("pass123");
         let parsed_ack_ack = PeerProbe::parse(&ack_ack).expect("Must parse ack_ack");
         assert!(parsed_ack_ack.verify("pass123"));
+    }
+
+    #[test]
+    fn test_peer_release_roundtrip() {
+        let rel = PeerRelease::new_signed("pass123");
+        let parsed_rel = PeerRelease::parse(&rel).expect("Must parse release");
+        assert!(parsed_rel.verify("pass123"));
+        assert!(!parsed_rel.verify("wrong"));
+
+        let ack = PeerReleaseAck::new_signed("pass123");
+        let parsed_ack = PeerReleaseAck::parse(&ack).expect("Must parse release ack");
+        assert!(parsed_ack.verify("pass123"));
+        assert!(!parsed_ack.verify("wrong"));
     }
 }
